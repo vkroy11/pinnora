@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -18,6 +18,9 @@ const KIND_LABELS: Record<DispatchKind, string> = {
 };
 
 const IN_FLIGHT_STATUSES: ClientRun["status"][] = ["connecting", "classifying", "dispatched", "streaming"];
+// Every tile body renders inside this same block height so grid rows line up regardless
+// of kind or how much content a given run produced.
+const TILE_BODY_HEIGHT = 176;
 
 export function CanvasTile({
   run,
@@ -160,19 +163,39 @@ function StatusBadge({ run }: { run: ClientRun }) {
   return <Badge variant={variant}>{label}</Badge>;
 }
 
+function TileFrame({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col justify-center gap-2" style={{ height: TILE_BODY_HEIGHT }}>
+      {children}
+    </div>
+  );
+}
+
 function TileBody({ run, onConfirm }: { run: ClientRun; onConfirm: (kind: DispatchKind) => void }) {
-  if (run.status === "connecting" || run.status === "classifying") {
-    return <Skeleton className="h-32 w-full" />;
+  if (run.status === "connecting" || run.status === "classifying" || run.status === "dispatched") {
+    return (
+      <TileFrame>
+        <Skeleton className="h-full w-full" />
+      </TileFrame>
+    );
   }
   if (run.status === "ambiguous") {
-    return <p className="text-sm text-muted-foreground">Couldn&apos;t tell what you wanted — try rephrasing.</p>;
+    return (
+      <TileFrame>
+        <p className="text-sm text-muted-foreground">Couldn&apos;t tell what you wanted — try rephrasing.</p>
+      </TileFrame>
+    );
   }
   if (run.status === "unsupported") {
-    return <p className="text-sm text-muted-foreground">Not supported yet.</p>;
+    return (
+      <TileFrame>
+        <p className="text-sm text-muted-foreground">Not supported yet.</p>
+      </TileFrame>
+    );
   }
   if (run.status === "awaiting_confirmation") {
     return (
-      <div className="flex flex-col gap-2">
+      <TileFrame>
         <p className="text-sm text-muted-foreground">
           Did you mean {run.kind ? KIND_LABELS[run.kind] : "this"}? ({Math.round((run.confidence ?? 0) * 100)}% sure)
         </p>
@@ -183,53 +206,119 @@ function TileBody({ run, onConfirm }: { run: ClientRun; onConfirm: (kind: Dispat
             </Button>
           ))}
         </div>
-      </div>
+      </TileFrame>
     );
   }
   if (run.status === "failed") {
-    return <p className="text-sm text-destructive">{run.error ?? "Something went wrong."}</p>;
+    return (
+      <TileFrame>
+        <p className="text-sm text-destructive">{run.error ?? "Something went wrong."}</p>
+      </TileFrame>
+    );
   }
   if (run.status === "cancelled") {
-    return <p className="text-sm text-muted-foreground">Cancelled — credits released.</p>;
+    return (
+      <TileFrame>
+        <p className="text-sm text-muted-foreground">Cancelled — credits released.</p>
+      </TileFrame>
+    );
   }
-  if (run.status === "dispatched") {
-    return <Skeleton className="h-32 w-full" />;
-  }
+
   // streaming or done
   if (run.kind === "image") {
-    return run.content?.url ? (
-      // eslint-disable-next-line @next/next/no-img-element
-      <img src={run.content.url} alt={run.prompt} className="aspect-video w-full rounded object-cover" />
-    ) : (
-      <Skeleton className="h-32 w-full" />
+    return (
+      <div style={{ height: TILE_BODY_HEIGHT }} className="overflow-hidden rounded">
+        {run.content?.url ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={run.content.url} alt={run.prompt} className="h-full w-full object-cover" />
+        ) : (
+          <Skeleton className="h-full w-full" />
+        )}
+      </div>
     );
   }
   if (run.kind === "landing-page") {
-    return run.content?.html ? <LandingPageThumbnail html={run.content.html} /> : <Skeleton className="h-32 w-full" />;
+    if (run.status === "streaming") {
+      return <CodeTypewriter code={run.content?.html ?? ""} />;
+    }
+    return run.content?.html ? (
+      <LandingPageThumbnail html={run.content.html} />
+    ) : (
+      <TileFrame>
+        <Skeleton className="h-full w-full" />
+      </TileFrame>
+    );
   }
   // email
   return (
-    <div className="flex flex-col gap-1 text-sm">
-      {run.content?.subject && <p className="font-semibold">{run.content.subject}</p>}
-      {run.content?.body && <p className="line-clamp-4 text-muted-foreground">{run.content.body}</p>}
-    </div>
+    <TileFrame>
+      <div className="flex h-full flex-col gap-1 overflow-hidden text-sm">
+        {run.content?.subject && <p className="line-clamp-1 font-semibold">{run.content.subject}</p>}
+        {run.content?.body && <p className="line-clamp-5 text-muted-foreground">{run.content.body}</p>}
+        {run.status === "streaming" && <BlinkingCursor />}
+      </div>
+    </TileFrame>
   );
 }
 
-/** A real live-rendered thumbnail: the iframe is laid out at full size then CSS-scaled down,
- * so the grid shows an actual miniature of the generated website rather than a text summary. */
+function BlinkingCursor() {
+  return <span className="inline-block h-3.5 w-1.5 animate-pulse bg-foreground align-middle" />;
+}
+
+/** While a landing page is still streaming, showing a half-parsed HTML doc in an iframe
+ * looks broken -- so we show the code growing (typewriter-style) instead, and only switch
+ * to the rendered iframe once the run is done and the document is actually complete. */
+function CodeTypewriter({ code }: { code: string }) {
+  const scrollRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [code]);
+
+  return (
+    <pre
+      ref={scrollRef}
+      style={{ height: TILE_BODY_HEIGHT }}
+      className="overflow-y-auto whitespace-pre-wrap break-all rounded border bg-muted p-2 font-mono text-[10px] leading-relaxed"
+    >
+      {code}
+      <BlinkingCursor />
+    </pre>
+  );
+}
+
+/** A real live-rendered thumbnail: the iframe is laid out at full size then CSS-scaled to
+ * exactly fill the tile's width (via ResizeObserver), so the grid shows an actual miniature
+ * of the generated website rather than a fixed-size crop with empty space around it. */
 function LandingPageThumbnail({ html }: { html: string }) {
-  const SCALE = 0.28;
   const WIDTH = 1200;
   const HEIGHT = 750;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [scale, setScale] = useState(0.3);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width;
+      if (width) setScale(width / WIDTH);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   return (
-    <div className="relative w-full overflow-hidden rounded border" style={{ height: HEIGHT * SCALE }}>
+    <div
+      ref={containerRef}
+      style={{ height: TILE_BODY_HEIGHT }}
+      className="relative w-full overflow-hidden rounded border bg-white"
+    >
       <iframe
         srcDoc={html}
         sandbox=""
         title="Landing page thumbnail"
-        className="pointer-events-none origin-top-left bg-white"
-        style={{ width: WIDTH, height: HEIGHT, transform: `scale(${SCALE})` }}
+        className="pointer-events-none origin-top-left"
+        style={{ width: WIDTH, height: HEIGHT, transform: `scale(${scale})` }}
       />
     </div>
   );
