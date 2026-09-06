@@ -5,7 +5,7 @@ import type { DispatchKind, RenderContent } from "@/db/schema";
 import { landingPageOutputSchema, emailOutputSchema } from "@/lib/schemas/render-output";
 import * as outputsRepo from "@/lib/db/repositories/outputs";
 
-const GENERATION_MODEL = "gemini-2.5-pro";
+const GENERATION_MODEL = "gemini-3.1-pro-preview";
 
 export type GenerationResult = { content: RenderContent; rationale: string | null };
 
