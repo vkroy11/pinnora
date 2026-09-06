@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Info, Square } from "lucide-react";
 import { confirmDispatchKind } from "@/app/actions/confirm-kind";
+import { cancelRun } from "@/app/actions/cancel-run";
 import type { ClientRun } from "@/components/run-types";
 import type { DispatchKind } from "@/db/schema";
 
@@ -15,18 +17,23 @@ const KIND_LABELS: Record<DispatchKind, string> = {
   email: "Email",
 };
 
+const IN_FLIGHT_STATUSES: ClientRun["status"][] = ["connecting", "classifying", "dispatched", "streaming"];
+
 export function CanvasTile({
-  initial,
+  run,
   subscribeLive,
+  onUpdate,
   onOpenDrawer,
+  onOpenModal,
   onImprovise,
 }: {
-  initial: ClientRun;
+  run: ClientRun;
   subscribeLive: boolean;
+  onUpdate: (runId: string, patch: Partial<ClientRun>) => void;
   onOpenDrawer: (runId: string) => void;
+  onOpenModal: (runId: string) => void;
   onImprovise: (parentArtifactId: string, kind: DispatchKind) => void;
 }) {
-  const [run, setRun] = useState<ClientRun>(initial);
   const runRef = useRef(run);
   useEffect(() => {
     runRef.current = run;
@@ -34,26 +41,28 @@ export function CanvasTile({
 
   useEffect(() => {
     if (!subscribeLive) return;
-    const source = new EventSource(`/api/runs/${initial.runId}/stream`);
+    const runId = run.runId;
+    const patch = (p: Partial<ClientRun>) => onUpdate(runId, p);
+    const source = new EventSource(`/api/runs/${runId}/stream`);
 
     source.addEventListener("classified", (e) => {
       const data = JSON.parse(e.data);
-      setRun((r) => ({ ...r, status: "classifying", kind: data.kind, confidence: data.confidence }));
+      patch({ status: "classifying", kind: data.kind, confidence: data.confidence });
     });
     source.addEventListener("awaiting_confirmation", (e) => {
       const data = JSON.parse(e.data);
-      setRun((r) => ({ ...r, status: "awaiting_confirmation", kind: data.kind, confidence: data.confidence }));
+      patch({ status: "awaiting_confirmation", kind: data.kind, confidence: data.confidence });
     });
-    source.addEventListener("ambiguous", () => setRun((r) => ({ ...r, status: "ambiguous" })));
-    source.addEventListener("unsupported", () => setRun((r) => ({ ...r, status: "unsupported" })));
-    source.addEventListener("dispatched", () => setRun((r) => ({ ...r, status: "dispatched" })));
+    source.addEventListener("ambiguous", () => patch({ status: "ambiguous" }));
+    source.addEventListener("unsupported", () => patch({ status: "unsupported" }));
+    source.addEventListener("dispatched", () => patch({ status: "dispatched" }));
     source.addEventListener("partial", (e) => {
       const data = JSON.parse(e.data);
-      setRun((r) => ({ ...r, status: "streaming", content: data.content }));
+      patch({ status: "streaming", content: data.content });
     });
     source.addEventListener("done", (e) => {
       const data = JSON.parse(e.data);
-      setRun((r) => ({ ...r, status: "done", content: data.content, rationale: data.rationale, outputId: data.outputId }));
+      patch({ status: "done", content: data.content, rationale: data.rationale, outputId: data.outputId });
       source.close();
     });
     source.addEventListener("error", (e) => {
@@ -62,47 +71,74 @@ export function CanvasTile({
       if (runRef.current.status === "done" || runRef.current.status === "cancelled") return;
       const data = (e as MessageEvent).data ? JSON.parse((e as MessageEvent).data) : null;
       if (data) {
-        setRun((r) => ({ ...r, status: "failed", error: data.message }));
+        patch({ status: "failed", error: data.message });
         source.close();
       }
     });
     source.addEventListener("cancelled", () => {
-      setRun((r) => ({ ...r, status: "cancelled" }));
+      patch({ status: "cancelled" });
       source.close();
     });
 
     return () => source.close();
-  }, [initial.runId, subscribeLive]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run.runId, subscribeLive]);
+
+  const canStop = IN_FLIGHT_STATUSES.includes(run.status);
+  const canOpenOutput = run.status === "streaming" || run.status === "done";
 
   return (
-    <Card className="cursor-pointer transition-shadow hover:shadow-md" onClick={() => onOpenDrawer(run.runId)}>
+    <Card className="overflow-hidden">
       <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0">
         <p className="line-clamp-2 text-sm font-medium">{run.prompt}</p>
-        <StatusBadge run={run} />
+        <div className="flex shrink-0 items-center gap-1">
+          <StatusBadge run={run} />
+          <Button variant="ghost" size="icon" className="size-7" title="Why this?" onClick={() => onOpenDrawer(run.runId)}>
+            <Info className="size-3.5" />
+          </Button>
+        </div>
       </CardHeader>
-      <CardContent>
-        <TileBody run={run} onConfirm={(kind) => {
-          void confirmDispatchKind({ runId: run.runId, kind });
-          setRun((r) => ({ ...r, status: "dispatched", kind }));
-        }} />
+      <CardContent
+        className={canOpenOutput ? "cursor-pointer" : undefined}
+        onClick={() => canOpenOutput && onOpenModal(run.runId)}
+      >
+        <TileBody
+          run={run}
+          onConfirm={(kind) => {
+            void confirmDispatchKind({ runId: run.runId, kind });
+            onUpdate(run.runId, { status: "dispatched", kind });
+          }}
+        />
       </CardContent>
-      {run.status === "done" && run.kind && run.outputId && (
-        <CardFooter className="flex flex-col items-start gap-1">
-          {run.parentArtifactId && (
-            <span className="text-xs text-muted-foreground">Improvised from →</span>
+      <CardFooter className="flex items-center justify-between gap-2">
+        <div className="flex flex-col items-start gap-1">
+          {run.parentArtifactId && <span className="text-xs text-muted-foreground">Improvised from →</span>}
+          {run.status === "done" && run.kind && run.outputId && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onImprovise(run.outputId!, run.kind!);
+              }}
+            >
+              Improvise
+            </Button>
           )}
+        </div>
+        {canStop && (
           <Button
             size="sm"
-            variant="secondary"
+            variant="outline"
             onClick={(e) => {
               e.stopPropagation();
-              onImprovise(run.outputId!, run.kind!);
+              void cancelRun(run.runId);
             }}
           >
-            Improvise
+            <Square className="size-3" /> Stop
           </Button>
-        </CardFooter>
-      )}
+        )}
+      </CardFooter>
     </Card>
   );
 }
@@ -168,15 +204,33 @@ function TileBody({ run, onConfirm }: { run: ClientRun; onConfirm: (kind: Dispat
       <Skeleton className="h-32 w-full" />
     );
   }
+  if (run.kind === "landing-page") {
+    return run.content?.html ? <LandingPageThumbnail html={run.content.html} /> : <Skeleton className="h-32 w-full" />;
+  }
+  // email
   return (
     <div className="flex flex-col gap-1 text-sm">
-      {run.content?.headline && <p className="font-semibold">{run.content.headline}</p>}
-      {run.content?.body && <p className="text-muted-foreground line-clamp-3">{run.content.body}</p>}
-      {run.content?.ctaLabel && (
-        <span className="mt-1 inline-block w-fit rounded bg-primary px-2 py-1 text-xs text-primary-foreground">
-          {run.content.ctaLabel}
-        </span>
-      )}
+      {run.content?.subject && <p className="font-semibold">{run.content.subject}</p>}
+      {run.content?.body && <p className="line-clamp-4 text-muted-foreground">{run.content.body}</p>}
+    </div>
+  );
+}
+
+/** A real live-rendered thumbnail: the iframe is laid out at full size then CSS-scaled down,
+ * so the grid shows an actual miniature of the generated website rather than a text summary. */
+function LandingPageThumbnail({ html }: { html: string }) {
+  const SCALE = 0.28;
+  const WIDTH = 1200;
+  const HEIGHT = 750;
+  return (
+    <div className="relative w-full overflow-hidden rounded border" style={{ height: HEIGHT * SCALE }}>
+      <iframe
+        srcDoc={html}
+        sandbox=""
+        title="Landing page thumbnail"
+        className="pointer-events-none origin-top-left bg-white"
+        style={{ width: WIDTH, height: HEIGHT, transform: `scale(${SCALE})` }}
+      />
     </div>
   );
 }

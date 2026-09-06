@@ -1,4 +1,3 @@
-import Link from "next/link";
 import { requireOwnedProject } from "@/lib/auth";
 import { listDispatchesWithOutputs } from "@/lib/db/repositories/dispatches";
 import { balance } from "@/lib/services/credit-service";
@@ -31,19 +30,8 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
   }));
 
   return (
-    <div className="flex h-screen flex-col">
-      <header className="flex items-center justify-between border-b px-4 py-3">
-        <div className="flex items-center gap-3">
-          <Link href="/projects" className="text-sm text-muted-foreground hover:underline">
-            ← Chats
-          </Link>
-          <h1 className="font-medium">{project.name}</h1>
-        </div>
-        <span className="text-sm text-muted-foreground">{credits} credits</span>
-      </header>
-      <div className="flex-1 overflow-hidden">
-        <ProjectCanvas projectId={id} initialRuns={initialRuns} />
-      </div>
+    <div className="h-screen">
+      <ProjectCanvas projectId={id} projectName={project.name} initialCredits={credits} initialRuns={initialRuns} />
     </div>
   );
 }
