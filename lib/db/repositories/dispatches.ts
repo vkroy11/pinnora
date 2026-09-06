@@ -49,6 +49,21 @@ export async function getDispatch(id: string) {
   return rows[0] ?? null;
 }
 
+/** Cross-instance cancellation signal (see schema comment) -- set by whichever
+ * instance is running the SSE route, polled by whichever instance is running the pipeline. */
+export async function requestCancel(id: string) {
+  await getDb().update(dispatches).set({ cancelRequested: true, updatedAt: new Date() }).where(eq(dispatches.id, id));
+}
+
+export async function isCancelRequested(id: string): Promise<boolean> {
+  const rows = await getDb()
+    .select({ cancelRequested: dispatches.cancelRequested })
+    .from(dispatches)
+    .where(eq(dispatches.id, id))
+    .limit(1);
+  return rows[0]?.cancelRequested ?? false;
+}
+
 export function listDispatchesForProject(projectId: string) {
   return getDb()
     .select()

@@ -1,0 +1,1 @@
+ALTER TABLE "dispatches" ADD COLUMN "cancel_requested" boolean DEFAULT false NOT NULL;

@@ -6,6 +6,7 @@ const dispatchesRepo = vi.hoisted(() => ({
   setError: vi.fn(),
   setClassified: vi.fn(),
   confirmKind: vi.fn(),
+  isCancelRequested: vi.fn().mockResolvedValue(false),
 }));
 vi.mock("@/lib/db/repositories/dispatches", () => dispatchesRepo);
 
@@ -28,9 +29,7 @@ const generator = vi.hoisted(() => ({
 vi.mock("@/lib/services/generator", () => generator);
 
 const runEvents = vi.hoisted(() => ({
-  publish: vi.fn(),
   registerAbortController: vi.fn(),
-  subscribe: vi.fn(),
   abortRun: vi.fn(),
 }));
 vi.mock("@/lib/services/run-events", () => runEvents);
@@ -57,7 +56,7 @@ describe("credit hold/settle/release around generation", () => {
       throw new DOMException("Aborted", "AbortError");
     });
 
-    await proceedWithDispatch("dispatch-1", "landing-page", controller.signal);
+    await proceedWithDispatch("dispatch-1", "landing-page", controller);
 
     expect(creditService.release).toHaveBeenCalledWith("hold-1");
     expect(creditService.settle).not.toHaveBeenCalled();
@@ -70,7 +69,7 @@ describe("credit hold/settle/release around generation", () => {
       rationale: "because it fits the prompt",
     });
 
-    await proceedWithDispatch("dispatch-1", "landing-page", new AbortController().signal);
+    await proceedWithDispatch("dispatch-1", "landing-page", new AbortController());
 
     expect(creditService.settle).toHaveBeenCalledWith("hold-1");
     expect(creditService.release).not.toHaveBeenCalled();
@@ -80,7 +79,7 @@ describe("credit hold/settle/release around generation", () => {
   it("releases the hold on a non-abort render error too", async () => {
     generator.generateCreative.mockRejectedValue(new Error("model blew up"));
 
-    await proceedWithDispatch("dispatch-1", "landing-page", new AbortController().signal);
+    await proceedWithDispatch("dispatch-1", "landing-page", new AbortController());
 
     expect(creditService.release).toHaveBeenCalledWith("hold-1");
     expect(creditService.settle).not.toHaveBeenCalled();

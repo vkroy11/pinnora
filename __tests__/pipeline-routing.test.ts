@@ -6,6 +6,7 @@ const dispatchesRepo = vi.hoisted(() => ({
   setError: vi.fn(),
   setClassified: vi.fn(),
   confirmKind: vi.fn(),
+  isCancelRequested: vi.fn().mockResolvedValue(false),
 }));
 vi.mock("@/lib/db/repositories/dispatches", () => dispatchesRepo);
 
@@ -33,9 +34,7 @@ const classifier = vi.hoisted(() => ({
 vi.mock("@/lib/services/classifier", () => classifier);
 
 const runEvents = vi.hoisted(() => ({
-  publish: vi.fn(),
   registerAbortController: vi.fn(),
-  subscribe: vi.fn(),
   abortRun: vi.fn(),
 }));
 vi.mock("@/lib/services/run-events", () => runEvents);
@@ -64,7 +63,6 @@ describe("runDispatchPipeline classifier routing", () => {
 
     expect(dispatchesRepo.setError).toHaveBeenCalledWith("dispatch-1", "unsupported", "Not supported yet.");
     expect(creditService.hold).not.toHaveBeenCalled();
-    expect(runEvents.publish).toHaveBeenCalledWith("dispatch-1", { type: "unsupported" });
   });
 
   it("aborts as ambiguous with no hold below 0.6 confidence", async () => {
