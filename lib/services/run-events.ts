@@ -32,12 +32,17 @@ const emitters = (globalForRunEvents.__pinnoraEmitters ??= new Map<string, Event
 const abortControllers = (globalForRunEvents.__pinnoraAbortControllers ??= new Map<string, AbortController>());
 const pendingCancels = (globalForRunEvents.__pinnoraPendingCancels ??= new Map<string, ReturnType<typeof setTimeout>>());
 
-// React Strict Mode (dev only) double-invokes effects: an EventSource opens, is
-// immediately closed by the synthetic cleanup, then a real one opens right after. That
-// synthetic close fires the stream route's abort handler -- without a grace period, every
-// fresh dispatch in local dev would get spuriously marked for cancellation before the real
-// connection even takes over. A short delay lets a near-instant reconnect cancel the check.
-const CANCEL_GRACE_MS = 1_000;
+// How long a dropped SSE connection has to come back before it counts as "the operator left".
+//
+// The brief wants a client disconnect to release the hold, but "disconnected" and "gone" are
+// not the same event, and the gap between them is measured in seconds:
+//   - React Strict Mode (dev) closes and reopens the EventSource within milliseconds.
+//   - A page reload reconnects in ~2-4s here (Turbopack + Clerk + RSC on a cold route).
+//   - A backgrounded tab or a brief network blip can pause delivery for a second or two.
+// A 1s window treated all of those as abandonment and cancelled live runs out from under the
+// operator -- refreshing the page killed whatever was generating. Any new connection for the
+// same run cancels the pending check, so a genuine close still releases, just seconds later.
+const CANCEL_GRACE_MS = 6_000;
 
 export function scheduleCancelCheck(runId: string, onCancel: () => void) {
   cancelPendingCancelCheck(runId);
