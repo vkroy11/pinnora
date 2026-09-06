@@ -12,6 +12,12 @@ const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled", "ambiguous", "
 // background generation job may never reach this request's instance. Polling the DB is
 // slower than a push but is correct regardless of which instance is doing the work.
 const POLL_MS = 400;
+// Slow models (e.g. a 15-20s time-to-first-token) can leave the response with zero bytes
+// written for long enough that intermediary proxies treat the connection as idle and kill
+// it -- the browser's EventSource then silently reconnects, which looks like "the stream
+// just isn't working". A periodic SSE comment line (ignored by EventSource's parser) keeps
+// bytes flowing so nothing in between decides the connection is dead.
+const HEARTBEAT_MS = 10_000;
 const MAX_STREAM_MS = 5 * 60 * 1000;
 
 function sseLine(event: RunEvent) {
@@ -59,16 +65,19 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
 
   const encoder = new TextEncoder();
   let closed = false;
+  let lastWriteAt = Date.now();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const send = (event: RunEvent) => {
+      const write = (raw: string) => {
         try {
-          controller.enqueue(encoder.encode(sseLine(event)));
+          controller.enqueue(encoder.encode(raw));
+          lastWriteAt = Date.now();
         } catch {
           // Client already disconnected.
         }
       };
+      const send = (event: RunEvent) => write(sseLine(event));
       const close = () => {
         if (closed) return;
         closed = true;
@@ -117,6 +126,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
           close();
           break;
         }
+        if (Date.now() - lastWriteAt > HEARTBEAT_MS) {
+          write(": heartbeat\n\n");
+        }
         const dispatch = await getDispatch(runId);
         if (!dispatch) {
           close();
@@ -147,6 +159,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
     },
   });
 }
