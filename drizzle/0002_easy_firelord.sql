@@ -1,0 +1,1 @@
+ALTER TABLE "dispatches" ADD COLUMN "classifier_model" text;

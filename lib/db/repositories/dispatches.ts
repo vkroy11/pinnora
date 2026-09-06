@@ -1,6 +1,6 @@
 import { getDb } from "@/db";
 import { dispatches, outputs, type DispatchKind, type DispatchStatus, type KindSource } from "@/db/schema";
-import { and, desc, eq, gt, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lt, ne, sql } from "drizzle-orm";
 
 export type PhaseEntry = { phase: string; at: string; detail?: string };
 
@@ -11,7 +11,6 @@ export async function insertQueuedDispatch(input: {
   explicitIntent: DispatchKind | null;
   parentArtifactId: string | null;
   idempotencyKey: string;
-  model: string;
 }) {
   const now = new Date().toISOString();
   const rows = await getDb()
@@ -49,6 +48,21 @@ export async function getDispatch(id: string) {
   return rows[0] ?? null;
 }
 
+/** Cross-instance cancellation signal (see schema comment) -- set by whichever
+ * instance is running the SSE route, polled by whichever instance is running the pipeline. */
+export async function requestCancel(id: string) {
+  await getDb().update(dispatches).set({ cancelRequested: true, updatedAt: new Date() }).where(eq(dispatches.id, id));
+}
+
+export async function isCancelRequested(id: string): Promise<boolean> {
+  const rows = await getDb()
+    .select({ cancelRequested: dispatches.cancelRequested })
+    .from(dispatches)
+    .where(eq(dispatches.id, id))
+    .limit(1);
+  return rows[0]?.cancelRequested ?? false;
+}
+
 export function listDispatchesForProject(projectId: string) {
   return getDb()
     .select()
@@ -80,6 +94,34 @@ async function appendPhase(id: string, entry: PhaseEntry) {
 export async function setStatus(id: string, status: DispatchStatus, phase?: string, detail?: string) {
   await getDb().update(dispatches).set({ status, updatedAt: new Date() }).where(eq(dispatches.id, id));
   if (phase) await appendPhase(id, { phase, at: new Date().toISOString(), detail });
+}
+
+const NON_TERMINAL_STATUSES: DispatchStatus[] = ["queued", "classifying", "dispatched", "streaming"];
+
+/** Runs whose pipeline stopped touching them -- a crash, a deploy, a server restart, or a
+ * serverless instance recycled mid-generation. `awaiting_confirmation` is excluded on purpose:
+ * it's waiting on a human, not stalled. */
+export function findStaleRuns(projectId: string, olderThanMs: number) {
+  const cutoff = new Date(Date.now() - olderThanMs);
+  return getDb()
+    .select({ id: dispatches.id })
+    .from(dispatches)
+    .where(
+      and(
+        eq(dispatches.projectId, projectId),
+        inArray(dispatches.status, NON_TERMINAL_STATUSES),
+        lt(dispatches.updatedAt, cutoff),
+      ),
+    );
+}
+
+export async function setClassifierModel(id: string, classifierModel: string) {
+  await getDb().update(dispatches).set({ classifierModel, updatedAt: new Date() }).where(eq(dispatches.id, id));
+}
+
+/** The model that actually produces the artifact, recorded when generation starts. */
+export async function setGenerationModel(id: string, model: string) {
+  await getDb().update(dispatches).set({ model, updatedAt: new Date() }).where(eq(dispatches.id, id));
 }
 
 export async function setClassified(

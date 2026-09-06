@@ -5,7 +5,9 @@ import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card"
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Info, Square } from "lucide-react";
 import { confirmDispatchKind } from "@/app/actions/confirm-kind";
+import { cancelRun } from "@/app/actions/cancel-run";
 import type { ClientRun } from "@/components/run-types";
 import type { DispatchKind } from "@/db/schema";
 
@@ -15,18 +17,31 @@ const KIND_LABELS: Record<DispatchKind, string> = {
   email: "Email",
 };
 
+const IN_FLIGHT_STATUSES: ClientRun["status"][] = ["connecting", "classifying", "dispatched", "streaming"];
+const TERMINAL_STATUSES: ClientRun["status"][] = ["done", "failed", "cancelled", "ambiguous", "unsupported"];
+// Every tile body renders inside this same block height so grid rows line up regardless
+// of kind or how much content a given run produced.
+const TILE_BODY_HEIGHT = 176;
+
 export function CanvasTile({
-  initial,
+  run,
   subscribeLive,
+  onUpdate,
+  onStreamError,
   onOpenDrawer,
+  onOpenModal,
+  onOpenParentModal,
   onImprovise,
 }: {
-  initial: ClientRun;
+  run: ClientRun;
   subscribeLive: boolean;
+  onUpdate: (runId: string, patch: Partial<ClientRun>) => void;
+  onStreamError: () => void;
   onOpenDrawer: (runId: string) => void;
+  onOpenModal: (runId: string) => void;
+  onOpenParentModal: (parentOutputId: string) => void;
   onImprovise: (parentArtifactId: string, kind: DispatchKind) => void;
 }) {
-  const [run, setRun] = useState<ClientRun>(initial);
   const runRef = useRef(run);
   useEffect(() => {
     runRef.current = run;
@@ -34,75 +49,125 @@ export function CanvasTile({
 
   useEffect(() => {
     if (!subscribeLive) return;
-    const source = new EventSource(`/api/runs/${initial.runId}/stream`);
+    const runId = run.runId;
+    const patch = (p: Partial<ClientRun>) => onUpdate(runId, p);
+    const source = new EventSource(`/api/runs/${runId}/stream`);
 
     source.addEventListener("classified", (e) => {
       const data = JSON.parse(e.data);
-      setRun((r) => ({ ...r, status: "classifying", kind: data.kind, confidence: data.confidence }));
+      patch({ status: "classifying", kind: data.kind, confidence: data.confidence });
     });
     source.addEventListener("awaiting_confirmation", (e) => {
       const data = JSON.parse(e.data);
-      setRun((r) => ({ ...r, status: "awaiting_confirmation", kind: data.kind, confidence: data.confidence }));
+      patch({ status: "awaiting_confirmation", kind: data.kind, confidence: data.confidence });
     });
-    source.addEventListener("ambiguous", () => setRun((r) => ({ ...r, status: "ambiguous" })));
-    source.addEventListener("unsupported", () => setRun((r) => ({ ...r, status: "unsupported" })));
-    source.addEventListener("dispatched", () => setRun((r) => ({ ...r, status: "dispatched" })));
+    source.addEventListener("ambiguous", () => {
+      patch({ status: "ambiguous" });
+      source.close();
+    });
+    source.addEventListener("unsupported", () => {
+      patch({ status: "unsupported" });
+      source.close();
+    });
+    source.addEventListener("dispatched", () => patch({ status: "dispatched" }));
     source.addEventListener("partial", (e) => {
       const data = JSON.parse(e.data);
-      setRun((r) => ({ ...r, status: "streaming", content: data.content }));
+      patch({ status: "streaming", content: data.content });
     });
     source.addEventListener("done", (e) => {
       const data = JSON.parse(e.data);
-      setRun((r) => ({ ...r, status: "done", content: data.content, rationale: data.rationale, outputId: data.outputId }));
+      patch({ status: "done", content: data.content, rationale: data.rationale, outputId: data.outputId });
       source.close();
     });
     source.addEventListener("error", (e) => {
-      // Only treat as a stream failure if we haven't already reached a terminal state
-      // (browsers fire a generic "error" event on clean server-side stream close too).
-      if (runRef.current.status === "done" || runRef.current.status === "cancelled") return;
+      // Only treat as a stream failure if we haven't already reached a terminal state --
+      // browsers fire a generic, data-less "error" event on any dropped connection, including
+      // a clean server-side close, so this must never flip an already-terminal tile to "failed".
+      if (TERMINAL_STATUSES.includes(runRef.current.status)) return;
       const data = (e as MessageEvent).data ? JSON.parse((e as MessageEvent).data) : null;
       if (data) {
-        setRun((r) => ({ ...r, status: "failed", error: data.message }));
+        patch({ status: "failed", error: data.message });
         source.close();
+        return;
       }
+      // Data-less error == the connection dropped. Don't guess at state; ask the server.
+      onStreamError();
     });
     source.addEventListener("cancelled", () => {
-      setRun((r) => ({ ...r, status: "cancelled" }));
+      patch({ status: "cancelled" });
       source.close();
     });
 
     return () => source.close();
-  }, [initial.runId, subscribeLive]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run.runId, subscribeLive]);
+
+  const canStop = IN_FLIGHT_STATUSES.includes(run.status);
+  const canOpenOutput = run.status === "streaming" || run.status === "done";
 
   return (
-    <Card className="cursor-pointer transition-shadow hover:shadow-md" onClick={() => onOpenDrawer(run.runId)}>
+    <Card className="overflow-hidden">
       <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0">
         <p className="line-clamp-2 text-sm font-medium">{run.prompt}</p>
-        <StatusBadge run={run} />
+        <div className="flex shrink-0 items-center gap-1">
+          <StatusBadge run={run} />
+          <Button variant="ghost" size="icon" className="size-7" title="Why this?" onClick={() => onOpenDrawer(run.runId)}>
+            <Info className="size-3.5" />
+          </Button>
+        </div>
       </CardHeader>
-      <CardContent>
-        <TileBody run={run} onConfirm={(kind) => {
-          void confirmDispatchKind({ runId: run.runId, kind });
-          setRun((r) => ({ ...r, status: "dispatched", kind }));
-        }} />
+      <CardContent
+        className={canOpenOutput ? "cursor-pointer" : undefined}
+        onClick={() => canOpenOutput && onOpenModal(run.runId)}
+      >
+        <TileBody
+          run={run}
+          onConfirm={(kind) => {
+            void confirmDispatchKind({ runId: run.runId, kind });
+            onUpdate(run.runId, { status: "dispatched", kind });
+          }}
+        />
       </CardContent>
-      {run.status === "done" && run.kind && run.outputId && (
-        <CardFooter className="flex flex-col items-start gap-1">
+      <CardFooter className="flex items-center justify-between gap-2">
+        <div className="flex flex-col items-start gap-1">
           {run.parentArtifactId && (
-            <span className="text-xs text-muted-foreground">Improvised from →</span>
+            <button
+              type="button"
+              className="text-xs text-muted-foreground hover:underline"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenParentModal(run.parentArtifactId!);
+              }}
+            >
+              Improvised from → {run.parentArtifactId?.slice(0, 8)}...
+            </button>
           )}
+          {run.status === "done" && run.kind && run.outputId && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onImprovise(run.outputId!, run.kind!);
+              }}
+            >
+              Improvise
+            </Button>
+          )}
+        </div>
+        {canStop && (
           <Button
             size="sm"
-            variant="secondary"
+            variant="outline"
             onClick={(e) => {
               e.stopPropagation();
-              onImprovise(run.outputId!, run.kind!);
+              void cancelRun(run.runId);
             }}
           >
-            Improvise
+            <Square className="size-3" /> Stop
           </Button>
-        </CardFooter>
-      )}
+        )}
+      </CardFooter>
     </Card>
   );
 }
@@ -124,19 +189,70 @@ function StatusBadge({ run }: { run: ClientRun }) {
   return <Badge variant={variant}>{label}</Badge>;
 }
 
+function TileFrame({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col justify-center gap-2" style={{ height: TILE_BODY_HEIGHT }}>
+      {children}
+    </div>
+  );
+}
+
+/** What the run is doing right now, in plain language, so a pending tile is never a
+ * silent grey box. Mirrors the phase timeline the "why this?" drawer shows after the fact. */
+function activityLabel(run: ClientRun): string | null {
+  switch (run.status) {
+    case "connecting":
+      return "Queued — sending to the classifier…";
+    case "classifying":
+      return run.kind ? `Classified as ${KIND_LABELS[run.kind]} — reserving credits…` : "Classifying your prompt…";
+    case "dispatched":
+      return "10 credits held — generating…";
+    case "streaming": {
+      const chars = (run.content?.html ?? run.content?.body ?? "").length;
+      return chars > 0 ? `Streaming… ${chars.toLocaleString()} characters` : "Streaming…";
+    }
+    default:
+      return null;
+  }
+}
+
+function ActivityLine({ run }: { run: ClientRun }) {
+  const label = activityLabel(run);
+  if (!label) return null;
+  return (
+    <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+      <span className="inline-block size-1.5 animate-pulse rounded-full bg-muted-foreground" />
+      {label}
+    </p>
+  );
+}
+
 function TileBody({ run, onConfirm }: { run: ClientRun; onConfirm: (kind: DispatchKind) => void }) {
-  if (run.status === "connecting" || run.status === "classifying") {
-    return <Skeleton className="h-32 w-full" />;
+  if (run.status === "connecting" || run.status === "classifying" || run.status === "dispatched") {
+    return (
+      <TileFrame>
+        <Skeleton className="h-full w-full" />
+        <ActivityLine run={run} />
+      </TileFrame>
+    );
   }
   if (run.status === "ambiguous") {
-    return <p className="text-sm text-muted-foreground">Couldn&apos;t tell what you wanted — try rephrasing.</p>;
+    return (
+      <TileFrame>
+        <p className="text-sm text-muted-foreground">Couldn&apos;t tell what you wanted — try rephrasing.</p>
+      </TileFrame>
+    );
   }
   if (run.status === "unsupported") {
-    return <p className="text-sm text-muted-foreground">Not supported yet.</p>;
+    return (
+      <TileFrame>
+        <p className="text-sm text-muted-foreground">Not supported yet.</p>
+      </TileFrame>
+    );
   }
   if (run.status === "awaiting_confirmation") {
     return (
-      <div className="flex flex-col gap-2">
+      <TileFrame>
         <p className="text-sm text-muted-foreground">
           Did you mean {run.kind ? KIND_LABELS[run.kind] : "this"}? ({Math.round((run.confidence ?? 0) * 100)}% sure)
         </p>
@@ -147,36 +263,125 @@ function TileBody({ run, onConfirm }: { run: ClientRun; onConfirm: (kind: Dispat
             </Button>
           ))}
         </div>
-      </div>
+      </TileFrame>
     );
   }
   if (run.status === "failed") {
-    return <p className="text-sm text-destructive">{run.error ?? "Something went wrong."}</p>;
-  }
-  if (run.status === "cancelled") {
-    return <p className="text-sm text-muted-foreground">Cancelled — credits released.</p>;
-  }
-  if (run.status === "dispatched") {
-    return <Skeleton className="h-32 w-full" />;
-  }
-  // streaming or done
-  if (run.kind === "image") {
-    return run.content?.url ? (
-      // eslint-disable-next-line @next/next/no-img-element
-      <img src={run.content.url} alt={run.prompt} className="aspect-video w-full rounded object-cover" />
-    ) : (
-      <Skeleton className="h-32 w-full" />
+    return (
+      <TileFrame>
+        <p className="text-sm text-destructive">{run.error ?? "Something went wrong."}</p>
+      </TileFrame>
     );
   }
+  if (run.status === "cancelled") {
+    return (
+      <TileFrame>
+        <p className="text-sm text-muted-foreground">Cancelled — credits released.</p>
+      </TileFrame>
+    );
+  }
+
+  // streaming or done
+  if (run.kind === "image") {
+    return (
+      <div style={{ height: TILE_BODY_HEIGHT }} className="overflow-hidden rounded">
+        {run.content?.url ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={run.content.url} alt={run.prompt} className="h-full w-full object-cover" />
+        ) : (
+          <Skeleton className="h-full w-full" />
+        )}
+      </div>
+    );
+  }
+  if (run.kind === "landing-page") {
+    if (run.status === "streaming") {
+      return (
+        <div className="flex flex-col gap-1" style={{ height: TILE_BODY_HEIGHT }}>
+          <CodeTypewriter code={run.content?.html ?? ""} />
+          <ActivityLine run={run} />
+        </div>
+      );
+    }
+    return run.content?.html ? (
+      <LandingPageThumbnail html={run.content.html} />
+    ) : (
+      <TileFrame>
+        <Skeleton className="h-full w-full" />
+      </TileFrame>
+    );
+  }
+  // email
   return (
-    <div className="flex flex-col gap-1 text-sm">
-      {run.content?.headline && <p className="font-semibold">{run.content.headline}</p>}
-      {run.content?.body && <p className="text-muted-foreground line-clamp-3">{run.content.body}</p>}
-      {run.content?.ctaLabel && (
-        <span className="mt-1 inline-block w-fit rounded bg-primary px-2 py-1 text-xs text-primary-foreground">
-          {run.content.ctaLabel}
-        </span>
-      )}
+    <TileFrame>
+      <div className="flex h-full flex-col gap-1 overflow-hidden text-sm">
+        {run.content?.subject && <p className="line-clamp-1 font-semibold">{run.content.subject}</p>}
+        {run.content?.body && <p className="line-clamp-4 text-muted-foreground">{run.content.body}</p>}
+        {run.status === "streaming" && <BlinkingCursor />}
+      </div>
+      {run.status === "streaming" && <ActivityLine run={run} />}
+    </TileFrame>
+  );
+}
+
+function BlinkingCursor() {
+  return <span className="inline-block h-3.5 w-1.5 animate-pulse bg-foreground align-middle" />;
+}
+
+/** While a landing page is still streaming, showing a half-parsed HTML doc in an iframe
+ * looks broken -- so we show the code growing (typewriter-style) instead, and only switch
+ * to the rendered iframe once the run is done and the document is actually complete. */
+function CodeTypewriter({ code }: { code: string }) {
+  const scrollRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [code]);
+
+  return (
+    <pre
+      ref={scrollRef}
+      className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap break-all rounded border bg-muted p-2 font-mono text-[10px] leading-relaxed"
+    >
+      {code}
+      <BlinkingCursor />
+    </pre>
+  );
+}
+
+/** A real live-rendered thumbnail: the iframe is laid out at full size then CSS-scaled to
+ * exactly fill the tile's width (via ResizeObserver), so the grid shows an actual miniature
+ * of the generated website rather than a fixed-size crop with empty space around it. */
+function LandingPageThumbnail({ html }: { html: string }) {
+  const WIDTH = 1200;
+  const HEIGHT = 750;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [scale, setScale] = useState(0.3);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width;
+      if (width) setScale(width / WIDTH);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ height: TILE_BODY_HEIGHT }}
+      className="relative w-full overflow-hidden rounded border bg-white"
+    >
+      <iframe
+        srcDoc={html}
+        sandbox=""
+        title="Landing page thumbnail"
+        className="pointer-events-none origin-top-left"
+        style={{ width: WIDTH, height: HEIGHT, transform: `scale(${scale})` }}
+      />
     </div>
   );
 }

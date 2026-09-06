@@ -3,7 +3,7 @@ import { generateText, Output } from "ai";
 import { google } from "@ai-sdk/google";
 import { classifierOutputSchema, type ClassifierOutput } from "@/lib/schemas/classifier-output";
 
-const CLASSIFIER_MODEL = "gemini-2.5-flash-lite";
+export const CLASSIFIER_MODEL = "gemini-2.5-flash-lite";
 
 const SYSTEM_PROMPT = `You classify a creative-generation prompt into exactly one kind.
 Valid kinds: "image", "landing-page", "email", or "unsupported" (anything that isn't

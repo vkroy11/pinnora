@@ -4,6 +4,7 @@ import {
   text,
   integer,
   doublePrecision,
+  boolean,
   timestamp,
   jsonb,
   index,
@@ -75,8 +76,15 @@ export const dispatches = pgTable(
     // Lineage: points at the parent creative this run improved on.
     parentArtifactId: uuid("parent_artifact_id").references((): AnyPgColumn => outputs.id),
     status: text("status").$type<DispatchStatus>().notNull().default("queued"),
+    // Two models run per dispatch and the drawer should not conflate them: the small
+    // classifier that picked the kind, and the model that actually produced the artifact.
+    classifierModel: text("classifier_model"),
     model: text("model"),
     error: text("error"),
+    // Cross-instance cancellation signal: the SSE route (which may run on a different
+    // serverless instance than the generation job) sets this instead of relying on an
+    // in-memory AbortController it may not have access to. The pipeline polls it.
+    cancelRequested: boolean("cancel_requested").notNull().default(false),
     idempotencyKey: text("idempotency_key").notNull(),
     // [{ phase: string, at: string (ISO), detail?: string }]
     phases: jsonb("phases").$type<{ phase: string; at: string; detail?: string }[]>().notNull().default([]),
@@ -91,10 +99,12 @@ export const dispatches = pgTable(
 
 export type RenderContent = {
   url?: string; // image
-  headline?: string; // landing-page / email
-  body?: string;
-  ctaLabel?: string;
-  ctaUrl?: string;
+  html?: string; // landing-page: full self-contained HTML document
+  headline?: string; // landing-page: hero headline as plain text
+  ctaLabel?: string; // landing-page
+  ctaUrl?: string; // landing-page
+  subject?: string; // email
+  body?: string; // landing-page supporting copy / email body
 };
 
 // Creative outputs. 1:1 with a dispatch, self-referential for lineage.

@@ -23,6 +23,7 @@ export async function getRunDetails(runId: string) {
     classifiedConfidence: dispatch.classifiedConfidence,
     kindSource: dispatch.kindSource,
     model: dispatch.model,
+    classifierModel: dispatch.classifierModel,
     status: dispatch.status,
     error: dispatch.error,
     phases: dispatch.phases,

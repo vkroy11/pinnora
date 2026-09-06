@@ -15,3 +15,7 @@ export async function getProject(projectId: string) {
 export function listProjectsForUser(userId: string) {
   return getDb().select().from(projects).where(eq(projects.userId, userId)).orderBy(desc(projects.createdAt));
 }
+
+export async function updateProjectName(id: string, name: string) {
+  await getDb().update(projects).set({ name }).where(eq(projects.id, id));
+}

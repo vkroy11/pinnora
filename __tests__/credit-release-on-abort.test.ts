@@ -5,7 +5,10 @@ const dispatchesRepo = vi.hoisted(() => ({
   setStatus: vi.fn(),
   setError: vi.fn(),
   setClassified: vi.fn(),
+  setClassifierModel: vi.fn(),
+  setGenerationModel: vi.fn(),
   confirmKind: vi.fn(),
+  isCancelRequested: vi.fn().mockResolvedValue(false),
 }));
 vi.mock("@/lib/db/repositories/dispatches", () => dispatchesRepo);
 
@@ -24,18 +27,18 @@ vi.mock("@/lib/services/credit-service", () => creditService);
 
 const generator = vi.hoisted(() => ({
   generateCreative: vi.fn(),
+  GENERATION_MODEL: "test-generation-model",
 }));
 vi.mock("@/lib/services/generator", () => generator);
 
 const runEvents = vi.hoisted(() => ({
   publish: vi.fn(),
   registerAbortController: vi.fn(),
-  subscribe: vi.fn(),
   abortRun: vi.fn(),
 }));
 vi.mock("@/lib/services/run-events", () => runEvents);
 
-const { proceedWithDispatch } = await import("@/lib/services/pipeline");
+const { generateForDispatch } = await import("@/lib/services/pipeline");
 
 describe("credit hold/settle/release around generation", () => {
   beforeEach(() => {
@@ -46,7 +49,6 @@ describe("credit hold/settle/release around generation", () => {
       prompt: "a landing page for shoes",
       parentArtifactId: null,
     });
-    creditService.hold.mockResolvedValue("hold-1");
     outputsRepo.insertPendingOutput.mockResolvedValue({ id: "output-1" });
   });
 
@@ -57,7 +59,7 @@ describe("credit hold/settle/release around generation", () => {
       throw new DOMException("Aborted", "AbortError");
     });
 
-    await proceedWithDispatch("dispatch-1", "landing-page", controller.signal);
+    await generateForDispatch("dispatch-1", "landing-page", "hold-1", controller);
 
     expect(creditService.release).toHaveBeenCalledWith("hold-1");
     expect(creditService.settle).not.toHaveBeenCalled();
@@ -70,7 +72,7 @@ describe("credit hold/settle/release around generation", () => {
       rationale: "because it fits the prompt",
     });
 
-    await proceedWithDispatch("dispatch-1", "landing-page", new AbortController().signal);
+    await generateForDispatch("dispatch-1", "landing-page", "hold-1", new AbortController());
 
     expect(creditService.settle).toHaveBeenCalledWith("hold-1");
     expect(creditService.release).not.toHaveBeenCalled();
@@ -80,10 +82,18 @@ describe("credit hold/settle/release around generation", () => {
   it("releases the hold on a non-abort render error too", async () => {
     generator.generateCreative.mockRejectedValue(new Error("model blew up"));
 
-    await proceedWithDispatch("dispatch-1", "landing-page", new AbortController().signal);
+    await generateForDispatch("dispatch-1", "landing-page", "hold-1", new AbortController());
 
     expect(creditService.release).toHaveBeenCalledWith("hold-1");
     expect(creditService.settle).not.toHaveBeenCalled();
     expect(dispatchesRepo.setError).toHaveBeenCalledWith("dispatch-1", "failed", expect.stringContaining("model blew up"));
+  });
+
+  it("records the generation model, not the classifier model, on the dispatch", async () => {
+    generator.generateCreative.mockResolvedValue({ content: {}, rationale: null });
+
+    await generateForDispatch("dispatch-1", "email", "hold-1", new AbortController());
+
+    expect(dispatchesRepo.setGenerationModel).toHaveBeenCalledWith("dispatch-1", "test-generation-model");
   });
 });

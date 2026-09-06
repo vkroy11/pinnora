@@ -12,13 +12,51 @@ export type RunEvent =
   | { type: "error"; message: string }
   | { type: "cancelled" };
 
-// In-memory per-runId pub/sub bridging generation (running inline via `after()`)
-// to SSE subscribers on the same server instance. No real job queue per the
-// exercise's out-of-scope note -- a reload always falls back to the DB-persisted
-// state (see the stream route), so this is a liveness optimization, not a
-// correctness dependency.
-const emitters = new Map<string, EventEmitter>();
-const abortControllers = new Map<string, AbortController>();
+// Same-instance pub/sub. On Vercel (multiple serverless instances, no shared memory) this
+// is NOT relied on for correctness -- the stream route falls back to DB polling there (see
+// lib/config.ts). Off Vercel (local dev, a persistent host like EC2) it's the only instance
+// there is, so this gives real push delivery with near-zero latency.
+//
+// These live on globalThis deliberately. Next.js bundles the "react-server" layer (server
+// components + server actions, where `after()` runs the pipeline) separately from route
+// handlers (where the SSE endpoint lives), so a plain module-level Map is instantiated
+// *twice* in the same process: the pipeline would publish into one copy while the stream
+// route subscribed to the other, and every event would land on zero listeners.
+const globalForRunEvents = globalThis as unknown as {
+  __pinnoraEmitters?: Map<string, EventEmitter>;
+  __pinnoraAbortControllers?: Map<string, AbortController>;
+  __pinnoraPendingCancels?: Map<string, ReturnType<typeof setTimeout>>;
+};
+
+const emitters = (globalForRunEvents.__pinnoraEmitters ??= new Map<string, EventEmitter>());
+const abortControllers = (globalForRunEvents.__pinnoraAbortControllers ??= new Map<string, AbortController>());
+const pendingCancels = (globalForRunEvents.__pinnoraPendingCancels ??= new Map<string, ReturnType<typeof setTimeout>>());
+
+// React Strict Mode (dev only) double-invokes effects: an EventSource opens, is
+// immediately closed by the synthetic cleanup, then a real one opens right after. That
+// synthetic close fires the stream route's abort handler -- without a grace period, every
+// fresh dispatch in local dev would get spuriously marked for cancellation before the real
+// connection even takes over. A short delay lets a near-instant reconnect cancel the check.
+const CANCEL_GRACE_MS = 1_000;
+
+export function scheduleCancelCheck(runId: string, onCancel: () => void) {
+  cancelPendingCancelCheck(runId);
+  pendingCancels.set(
+    runId,
+    setTimeout(() => {
+      pendingCancels.delete(runId);
+      onCancel();
+    }, CANCEL_GRACE_MS),
+  );
+}
+
+export function cancelPendingCancelCheck(runId: string) {
+  const timer = pendingCancels.get(runId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingCancels.delete(runId);
+  }
+}
 
 function getEmitter(runId: string) {
   let emitter = emitters.get(runId);
@@ -32,12 +70,8 @@ function getEmitter(runId: string) {
 
 export function publish(runId: string, event: RunEvent) {
   getEmitter(runId).emit("event", event);
-  if (event.type === "done" || event.type === "error" || event.type === "cancelled") {
-    // Give subscribers a tick to receive the terminal event before cleanup.
-    setTimeout(() => {
-      emitters.delete(runId);
-      abortControllers.delete(runId);
-    }, 5_000);
+  if (event.type === "done" || event.type === "error" || event.type === "cancelled" || event.type === "ambiguous" || event.type === "unsupported") {
+    setTimeout(() => emitters.delete(runId), 5_000);
   }
 }
 
@@ -49,9 +83,9 @@ export function subscribe(runId: string, onEvent: (event: RunEvent) => void) {
 
 export function registerAbortController(runId: string, controller: AbortController) {
   abortControllers.set(runId, controller);
+  controller.signal.addEventListener("abort", () => abortControllers.delete(runId), { once: true });
 }
 
-/** Called when the SSE route observes the client's request signal abort. */
 export function abortRun(runId: string) {
   abortControllers.get(runId)?.abort();
 }
