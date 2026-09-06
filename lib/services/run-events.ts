@@ -18,6 +18,33 @@ export type RunEvent =
 // there is, so this gives real push delivery with near-zero latency.
 const emitters = new Map<string, EventEmitter>();
 const abortControllers = new Map<string, AbortController>();
+const pendingCancels = new Map<string, ReturnType<typeof setTimeout>>();
+
+// React Strict Mode (dev only) double-invokes effects: an EventSource opens, is
+// immediately closed by the synthetic cleanup, then a real one opens right after. That
+// synthetic close fires the stream route's abort handler -- without a grace period, every
+// fresh dispatch in local dev would get spuriously marked for cancellation before the real
+// connection even takes over. A short delay lets a near-instant reconnect cancel the check.
+const CANCEL_GRACE_MS = 1_000;
+
+export function scheduleCancelCheck(runId: string, onCancel: () => void) {
+  cancelPendingCancelCheck(runId);
+  pendingCancels.set(
+    runId,
+    setTimeout(() => {
+      pendingCancels.delete(runId);
+      onCancel();
+    }, CANCEL_GRACE_MS),
+  );
+}
+
+export function cancelPendingCancelCheck(runId: string) {
+  const timer = pendingCancels.get(runId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingCancels.delete(runId);
+  }
+}
 
 function getEmitter(runId: string) {
   let emitter = emitters.get(runId);

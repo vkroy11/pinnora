@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { requireAppUser } from "@/lib/auth";
 import { getDispatch, requestCancel, type PhaseEntry } from "@/lib/db/repositories/dispatches";
 import { getOutputByDispatchId } from "@/lib/db/repositories/outputs";
-import { abortRun, subscribe, type RunEvent } from "@/lib/services/run-events";
+import { abortRun, cancelPendingCancelCheck, scheduleCancelCheck, subscribe, type RunEvent } from "@/lib/services/run-events";
 import { IS_VERCEL } from "@/lib/config";
 
 export const runtime = "nodejs";
@@ -64,6 +64,11 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
   if (!initialDispatch || initialDispatch.userId !== user.id) {
     return new Response("Not found", { status: 404 });
   }
+
+  // A new connection for this run supersedes any cancellation a previous connection's abort
+  // scheduled (see the CANCEL_GRACE_MS comment in run-events.ts) -- most commonly React
+  // Strict Mode's dev-only double-mount closing then reopening the EventSource.
+  cancelPendingCancelCheck(runId);
 
   const encoder = new TextEncoder();
   let closed = false;
@@ -163,8 +168,10 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
       closed = true;
       unsubscribe?.();
       if (heartbeatTimer) clearInterval(heartbeatTimer);
-      abortRun(runId);
-      void requestCancel(runId);
+      scheduleCancelCheck(runId, () => {
+        abortRun(runId);
+        void requestCancel(runId);
+      });
     },
   });
 
@@ -172,8 +179,10 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
     closed = true;
     unsubscribe?.();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    abortRun(runId);
-    void requestCancel(runId);
+    scheduleCancelCheck(runId, () => {
+      abortRun(runId);
+      void requestCancel(runId);
+    });
   });
 
   return new Response(stream, {
