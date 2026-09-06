@@ -1,36 +1,58 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+**Loom walkthrough:** _paste your public Loom URL here before submitting._
 
-## Getting Started
+# Pinnora — chat-driven creative generator
 
-First, run the development server:
+A take-home build for Skala Media's technical exercise: an operator types a prompt, a small
+classifier decides image / landing-page / email, an LLM streams the result, and the UI renders
+it as a tile in a grid — with credit hold/settle/release correctness and prompt lineage.
+
+## Run
+
+Env vars (all provisioned via Vercel Marketplace — `vercel env pull --yes` populates `.env.local`):
+
+- `DATABASE_URL`, `DATABASE_URL_UNPOOLED` — Neon Postgres (pooled for app runtime, unpooled for migrations)
+- `CLERK_SECRET_KEY`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` — Clerk auth
+- `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in`, `NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up`
+- `GOOGLE_GENERATIVE_AI_API_KEY` — direct Google AI Studio key (Gemini), used for both the classifier and the main generation call
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install
+pnpm db:migrate   # applies the tracked migration in drizzle/
+pnpm db:seed      # seeds the 3 orgs: Pinnora, Skala, Google
 pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Sign up via Clerk, pick an org on the onboarding screen (you start with 100 credits), click
+**New chat** (each chat is a project), and send a prompt. Each run costs 10 credits.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+`pnpm test` and `pnpm typecheck` are green.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Design rationale
 
-## Learn More
+**Classifier-then-dispatch.** The dispatch server action only validates input, auth-gates, checks
+idempotency, and persists a `queued` row — it never blocks on an LLM call (server actions can't
+stream, and a slow classifier shouldn't hold the request open). The actual classify → hold →
+generate pipeline runs via `after()` so it keeps executing past the returned response; a separate
+SSE route is the only way a client observes progress, and it replays persisted state on
+connect/reload so a refresh never shows a blank tile — it just resumes from whatever phase and
+partial content is in the DB.
 
-To learn more about Next.js, take a look at the following resources:
+**Credit lifecycle.** `credit_ledger` is append-mostly: a `hold` row is inserted (negative amount)
+before any generation work; `settle`/`release` only ever flip `settledAt`/`releasedAt` on that same
+row. Balance is always `SUM(amount) WHERE releasedAt IS NULL` — there's no cached balance column
+anywhere, so there's nothing to drift. Release is called from exactly three places: classifier
+rejection (`<0.6` confidence or `unsupported`), a render error, and client abort (the SSE route's
+`request.signal` is the only correct abort hook — it fires an `AbortController` that's threaded
+into the actual AI SDK call, so aborting stops real work, not just the HTTP response).
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+**Confidence bands.** `<0.6` aborts with no hold; `0.6–0.8` persists the dispatch (for audit/lineage)
+in `awaiting_confirmation` and surfaces confirm chips in the tile — clicking one records
+`kindSource: 'human'` before proceeding; `>0.8` (or an explicit intent from "Improvise") proceeds
+automatically with `kindSource: 'llm'`/`'human'`. Anything outside the three kinds classifies as
+`unsupported` and aborts with "Not supported yet." before any hold or render.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**What I'd do next.** Add batch (`count: N`) fan-out sharing one hold; move the in-memory
+run-events pub/sub to something that survives across serverless instances (Vercel Queues or a
+Postgres LISTEN/NOTIFY) since right now a reload against a *different* instance only gets the
+last DB-persisted state, not live updates, until it terminates; and add optimistic-UI polish for
+the confirm-chip flow so the tile doesn't flash between "awaiting confirmation" and "dispatched."
