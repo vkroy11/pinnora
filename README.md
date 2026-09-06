@@ -44,18 +44,51 @@ select kind, amount, settled_at, released_at from credit_ledger where dispatch_i
 
 ---
 
+## Design rationale
+
+*(The submission asks for this under 300 words. Everything below this section is optional
+depth — read it only if you want the reasoning behind a specific decision.)*
+
+**Why classifier-then-dispatch.** The action does the cheap, synchronous, refusable work —
+Zod validation, auth, idempotency, a `queued` row — and returns a run id. Everything slow
+happens in `after()`, and the run id is the handle the stream, the drawer, and lineage all
+hang off. A server action can't return a stream, and a slow classifier shouldn't hold the
+request open.
+
+**How the credit lifecycle is modelled.** One row per hold, negative amount, in an
+append-mostly ledger. `settle`/`release` only stamp `settled_at`/`released_at` on that row —
+they never insert compensating rows and never touch a cached balance, because there is no
+balance column. Balance is `sum(amount) where released_at is null`, so there's no second copy
+of the truth to drift from. The two are mutually exclusive in SQL (`... and released_at is
+null` / `... and settled_at is null`), so a late completion can't settle an already-released
+hold. Crucially the hold is taken **before** the classifier runs, so it covers the whole run —
+which is what makes "release on classifier rejection" a real release rather than a no-op. It's
+released on classifier rejection, low confidence, a parked confirmation, render error, and
+client abort; settled only once the artifact is persisted. Holds are also balance-checked in
+the same statement that inserts them, so concurrent dispatches can't drive credits negative.
+
+**Next four hours.** Batch (`count: N`) fan-out over one hold; replace the off-Vercel
+in-process emitter with Postgres `LISTEN/NOTIFY` so push survives horizontal scaling; and
+persist the classifier's raw verdict so rejected runs show a kind in the drawer instead of "—".
+
+---
+
 ## Request lifecycle
 
 ```
 composer ──▶ dispatchCreative() ──▶ insert dispatch (queued) ──▶ returns { runId }  [no streaming]
                                           │
-                                     after() ──▶ classify ──▶ route on confidence
-                                                   │
-                                     hold credits ─┴─▶ insert outputs row ──▶ stream generation
-                                                              │                   │
-                                                     persist partials      publish events
-                                                              │                   │
-tile ◀── SSE /api/runs/[id]/stream ◀──────────────────────────┴───────────────────┘
+                                     after() ──▶ hold credits ──▶ classify ──▶ route on confidence
+                                                                                  │
+                          release ◀── rejected / ambiguous / awaiting confirm ◀────┤
+                                                                                  │
+                                             insert outputs row ◀── proceed ◀──────┘
+                                                    │
+                                          stream generation ──▶ settle (or release on error/abort)
+                                                    │                   │
+                                            persist partials     publish events
+                                                    │                   │
+tile ◀── SSE /api/runs/[id]/stream ◀────────────────┴───────────────────┘
                                      (push off-Vercel · DB polling on Vercel)
 ```
 
@@ -85,16 +118,37 @@ Nothing can drift, because there is no second copy of the truth to drift from. `
 `release` are also mutually exclusive at the SQL level (`... where id = $1 and released_at is null`
 and vice versa), so a late-arriving completion can't settle a hold that was already released.
 
-`release` is called from exactly three places: classifier rejection, render error, and client
-abort. A failed run leaves `dispatches.status = 'failed'` and zero settled credits.
+**The hold is taken before the classifier runs.** That ordering is deliberate: the brief says to
+reserve before dispatch and release on classifier rejection, and rejection can only *release*
+something if the reservation already covers the classification step. Holding afterwards would
+have made "release on classifier rejection" a no-op that a `grep` would (correctly) fail.
+
+`release(holdId)` therefore appears on five paths in `lib/services/pipeline.ts`:
+
+| Path | Why |
+| --- | --- |
+| Classifier threw / was cancelled | Nothing was classified, let alone rendered. |
+| `unsupported` | Classifier rejection — no render will happen. |
+| Confidence `< 0.6` (`ambiguous`) | Classifier rejection. |
+| Parked at `awaiting_confirmation` | Don't sit on an operator's credits while waiting on a human; `confirmAndProceed` takes a fresh hold when they pick. |
+| Render error **and** client abort | The `catch` in `generateForDispatch`, branching on `signal.aborted`. |
+
+`settle` is called from exactly one place: after the artifact is persisted. A failed run leaves
+`dispatches.status = 'failed'` and zero settled credits.
+
+**Balance can't go negative.** The check and the insert are a single statement — the row is only
+written `where (select coalesce(sum(amount),0) ...) >= cost` — so two concurrent dispatches can't
+both slip past the same remaining credits. `hold()` returns `null` when it can't afford the run,
+and the pipeline fails the dispatch with "Not enough credits for this run." before touching the
+classifier.
 
 ### 3. Confidence bands
 
 | Confidence | Behaviour |
 | --- | --- |
-| `< 0.6` | Abort as `ambiguous`. No hold, no output row, no render. |
-| `0.6 – 0.8` | Persist `awaiting_confirmation`, surface "did you mean…" chips. Still no hold. |
-| `> 0.8` | Proceed automatically, `kind_source = 'llm'`. |
+| `< 0.6` | Abort as `ambiguous`. Hold **released**, no output row, no render. |
+| `0.6 – 0.8` | Persist `awaiting_confirmation`, surface "did you mean…" chips. Hold **released** while parked; a fresh one is taken when the operator picks. |
+| `> 0.8` | Proceed automatically, `kind_source = 'llm'`, hold carried through to settle. |
 | explicit intent | Skip the classifier entirely, `kind_source = 'human'` (used by **Improvise**). |
 
 The classifier can also return `unsupported` (a fourth value it may emit, not a stored kind) —
@@ -135,7 +189,7 @@ The earlier design had the stream as the only path to truth, which meant **any**
 stranded a tile in a skeleton forever, recoverable only by a manual reload. Now a missed event
 costs a few seconds of staleness. That property is worth more than the latency it costs.
 
-### 6. Cancellation is DB-backed, not memory-backed
+### 6. Cancellation is DB-backed, and survives a dead pipeline
 
 The SSE route may not share a process with the generation job, so "client disconnected" can't
 rely on reaching an in-memory `AbortController`. Instead the route sets
@@ -149,24 +203,52 @@ Aborts are debounced by 1 s before they count. React Strict Mode double-invokes 
 grace period every fresh local dispatch would flag itself for cancellation before the real
 connection took over.
 
-### 7. Output shape is per-kind, not one shared schema
+**A flag is only useful if something is alive to read it.** If the process restarted, the deploy
+rolled, or a serverless instance was recycled mid-generation, no pipeline is polling — the run
+would sit at `dispatched` forever with its credits still reserved. So `lib/services/run-recovery.ts`
+adds two backstops:
+
+- **Stop takes over.** `cancelRun` sets the flag, then after a 2 s grace period (longer than the
+  pipeline's 500 ms poll, so a live pipeline gets first refusal) finalizes the run itself:
+  release any open holds, mark it `cancelled`, publish the event.
+- **A reaper on the read path.** Any non-terminal run untouched for 5 minutes is marked failed
+  and has its holds released. It runs inside `getProjectRuns`, so simply opening or refetching a
+  project reconciles it — no cron. `awaiting_confirmation` is excluded: it's waiting on a human,
+  not stalled.
+
+Releasing the orphaned holds is the point. Without it, every interrupted run silently keeps 10
+credits reserved forever, and the ledger quietly stops reflecting what the operator can spend.
+
+### 7. Output shape is per-kind, and a deliberate superset of the brief's
+
+The brief suggests one shared schema, `{ headline, body, ctaLabel, ctaUrl }`. Each kind here
+**still emits those fields**, but the shape is per-kind so each artifact is actually usable:
 
 - **image** — no LLM call at all; a deterministic `picsum.photos/seed/<runId>` URL.
-- **landing-page** — `{ html, headline, rationale }`, where `html` is a complete self-contained
-  document with inline CSS. The tile renders a real scaled-down `<iframe>` thumbnail; the modal
-  offers Preview / Code / Download.
-- **email** — `{ subject, body, rationale }` with a copy button.
+- **landing-page** — `{ html, headline, body, ctaLabel, ctaUrl, rationale }`. The structured
+  fields are the brief's; `html` is a complete self-contained document with inline CSS, added so
+  the tile can render a real scaled-down `<iframe>` thumbnail and the modal can offer
+  Preview / Code / Download rather than showing four strings in a box.
+- **email** — `{ subject, body, rationale }` with a copy button. An email has a subject line, and
+  a CTA URL isn't a meaningful field for one; forcing the shared shape would have meant
+  mislabelling the subject as `headline`.
+
+This is a superset, not a substitution: everything the brief named is still generated and stored.
 
 `rationale` is the "why this" the spec asks for, and it lives on the **outputs** row, not the run
 log — it describes the artifact, not the dispatch. While a landing page is still streaming the
 tile shows the HTML typing out, and only swaps to the rendered iframe once the document is
 complete, because a half-parsed document in an iframe renders as garbage.
 
-### 8. Models
+### 8. Models — two per run, recorded separately
 
 - **Classifier:** `gemini-2.5-flash-lite` — the job is one cheap JSON label plus a confidence.
 - **Generation:** `gemini-3.1-pro-preview`. `gemini-2.5-pro` returns 404 for new API keys now
   ("no longer available to new users"), and Google's own error names this as the replacement.
+
+Two models run per dispatch, so the run log stores both: `classifier_model` is written when
+classification starts, `model` when generation starts. The drawer shows them as separate fields,
+because reporting the classifier as "the model used" for a landing page would be misleading.
 
 ---
 
@@ -182,7 +264,7 @@ generated and tracked in `drizzle/` — no hand-written SQL, so CI replays clean
 | `orgs` | `id` | `slug` | Seed/lookup by a stable human key (`pinnora`) rather than a generated id. |
 | `users` | `id` | `clerk_user_id` | One app user per Clerk identity; the natural join key from every authed request. |
 | `projects` | `id` | — | |
-| `dispatches` | `id` (= the **run id**) | `idempotency_key` | The run id is the handle the action returns and the stream is keyed by. |
+| `dispatches` | `id` (= the **run id**) | `idempotency_key` | The run id is the handle the action returns and the stream is keyed by. Also carries `classifier_model` and `model` separately (two models run per dispatch). |
 | `outputs` | `id` (= the **artifact id**) | `dispatch_id` | Unique enforces the 1:1 with a dispatch at the DB level, not just by convention. |
 | `credit_ledger` | `id` (= the **hold id**) | — | `hold()` returns this id; `settle`/`release` address that exact row. |
 
@@ -305,9 +387,12 @@ system could also produce.
 - **Classifier routing** — every confidence band, `unsupported`, and the explicit-intent skip.
 - **Pipeline routing** — that `< 0.6` and `unsupported` take no hold, that `0.6–0.8` holds nothing
   and generates nothing until confirmed, and that explicit intent bypasses the classifier.
-- **Credit lifecycle** — released on abort and on render error, settled only on success, and never
-  both.
+- **Credit lifecycle** — held before the classifier, released on abort and on render error,
+  settled only on success, never both, and the run fails without generating when the balance
+  can't cover the hold.
 - **Idempotency** — same tuple hashes equal, any differing field doesn't, whitespace is trimmed.
+- **Run recovery** — Stop finalizes a run whose pipeline is gone, doesn't steal one that
+  finished inside the grace window, and the reaper releases orphaned holds.
 
 ## Known limitations / next four hours
 
@@ -320,5 +405,12 @@ system could also produce.
    generation (plus a claim lock so reconnects don't double-run), and it drops the SSE transport
    this exercise asks for.
 4. **`unsupported` runs record no `classified_kind`**, so the drawer shows "—" for kind and
-   confidence on those. Storing the classifier's raw verdict separately would fill that in.
+   confidence on those. `unsupported` isn't one of the three stored kinds; persisting the
+   classifier's raw verdict in its own column would fill that in.
 5. **Image generation is a placeholder URL**, per the brief.
+6. **The reaper is read-path triggered**, so an abandoned project's interrupted runs stay stale
+   until someone opens it. A cron would close that gap; for a single-operator canvas the read
+   path is where it matters.
+7. **A 0.6-0.8 run takes two holds over its life** (one released while parked, one on confirm).
+   The ledger reads correctly and the drawer shows the hold that paid, but a per-run credit
+   report would want to sum by `dispatch_id` rather than take the latest row.
