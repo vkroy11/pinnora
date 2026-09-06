@@ -4,14 +4,14 @@ import * as outputsRepo from "@/lib/db/repositories/outputs";
 import * as creditService from "@/lib/services/credit-service";
 import { classifyPrompt } from "@/lib/services/classifier";
 import { generateCreative } from "@/lib/services/generator";
-import { registerAbortController } from "@/lib/services/run-events";
+import { publish, registerAbortController } from "@/lib/services/run-events";
 import { routeClassification } from "@/lib/services/classifier-routing";
 import type { DispatchKind } from "@/db/schema";
 
 const CANCEL_POLL_MS = 500;
 
-/** Polls the DB-backed cancellation flag and aborts `controller` when it's set. The SSE
- * route (which may be a different serverless instance than this one) can only signal
+/** Polls the DB-backed cancellation flag and aborts `controller` when it's set. On Vercel
+ * the SSE route may be a different serverless instance than this one and can only signal
  * cancellation through the DB -- it has no access to this process's AbortController. */
 function watchForCancellation(dispatchId: string, controller: AbortController) {
   const interval = setInterval(async () => {
@@ -47,9 +47,11 @@ export async function runDispatchPipeline(dispatchId: string) {
   } catch (err) {
     if (controller.signal.aborted) {
       await dispatchesRepo.setError(dispatchId, "cancelled", "Cancelled during classification");
+      publish(dispatchId, { type: "cancelled" });
       return;
     }
     await dispatchesRepo.setError(dispatchId, "failed", `Classifier error: ${(err as Error).message}`);
+    publish(dispatchId, { type: "error", message: "Classifier error" });
     return;
   } finally {
     stopWatching();
@@ -60,16 +62,20 @@ export async function runDispatchPipeline(dispatchId: string) {
   switch (route.action) {
     case "unsupported":
       await dispatchesRepo.setError(dispatchId, "unsupported", "Not supported yet.");
+      publish(dispatchId, { type: "unsupported" });
       return;
     case "abort_ambiguous":
       await dispatchesRepo.setStatus(dispatchId, "ambiguous", "ambiguous");
+      publish(dispatchId, { type: "ambiguous" });
       return;
     case "confirm":
       await dispatchesRepo.setClassified(dispatchId, { kind: route.kind, confidence: route.confidence, source: "llm" });
       await dispatchesRepo.setStatus(dispatchId, "awaiting_confirmation");
+      publish(dispatchId, { type: "awaiting_confirmation", kind: route.kind, confidence: route.confidence });
       return;
     case "proceed":
       await dispatchesRepo.setClassified(dispatchId, { kind: route.kind, confidence: route.confidence, source: "llm" });
+      publish(dispatchId, { type: "classified", kind: route.kind, confidence: route.confidence, source: "llm" });
       await proceedWithDispatch(dispatchId, route.kind, controller);
       return;
   }
@@ -82,8 +88,9 @@ export async function proceedWithDispatch(dispatchId: string, kind: DispatchKind
 
   const holdId = await creditService.hold(dispatch.userId, dispatchId);
   await dispatchesRepo.setStatus(dispatchId, "dispatched", "dispatched");
+  publish(dispatchId, { type: "dispatched" });
 
-  await outputsRepo.insertPendingOutput({
+  const pendingOutput = await outputsRepo.insertPendingOutput({
     dispatchId,
     kind,
     parentId: dispatch.parentArtifactId ?? null,
@@ -95,8 +102,7 @@ export async function proceedWithDispatch(dispatchId: string, kind: DispatchKind
 
   const stopWatching = watchForCancellation(dispatchId, controller);
   try {
-    // generateCreative persists content/rationale to the outputs row itself as it goes.
-    await generateCreative({
+    const { content, rationale } = await generateCreative({
       runId: dispatchId,
       dispatchId,
       kind,
@@ -106,13 +112,16 @@ export async function proceedWithDispatch(dispatchId: string, kind: DispatchKind
     });
     await creditService.settle(holdId);
     await dispatchesRepo.setStatus(dispatchId, "done", "done");
+    publish(dispatchId, { type: "done", content, rationale, outputId: pendingOutput.id });
   } catch (err) {
     await creditService.release(holdId);
     if (controller.signal.aborted) {
       await dispatchesRepo.setError(dispatchId, "cancelled", "Cancelled by client");
+      publish(dispatchId, { type: "cancelled" });
     } else {
       const message = (err as Error).message || "Render error";
       await dispatchesRepo.setError(dispatchId, "failed", message);
+      publish(dispatchId, { type: "error", message });
     }
   } finally {
     stopWatching();

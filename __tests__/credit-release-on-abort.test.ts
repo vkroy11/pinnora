@@ -29,6 +29,7 @@ const generator = vi.hoisted(() => ({
 vi.mock("@/lib/services/generator", () => generator);
 
 const runEvents = vi.hoisted(() => ({
+  publish: vi.fn(),
   registerAbortController: vi.fn(),
   abortRun: vi.fn(),
 }));

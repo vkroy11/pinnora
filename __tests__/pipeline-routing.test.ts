@@ -34,6 +34,7 @@ const classifier = vi.hoisted(() => ({
 vi.mock("@/lib/services/classifier", () => classifier);
 
 const runEvents = vi.hoisted(() => ({
+  publish: vi.fn(),
   registerAbortController: vi.fn(),
   abortRun: vi.fn(),
 }));

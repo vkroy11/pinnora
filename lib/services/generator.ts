@@ -4,6 +4,7 @@ import { google } from "@ai-sdk/google";
 import type { DispatchKind, RenderContent } from "@/db/schema";
 import { landingPageOutputSchema, emailOutputSchema } from "@/lib/schemas/render-output";
 import * as outputsRepo from "@/lib/db/repositories/outputs";
+import { publish } from "@/lib/services/run-events";
 
 const GENERATION_MODEL = "gemini-3.1-pro-preview";
 
@@ -41,7 +42,9 @@ export async function generateCreative(input: {
     });
 
     for await (const partial of result.partialOutputStream) {
-      await outputsRepo.updatePartialContent(input.dispatchId, { subject: partial.subject, body: partial.body });
+      const partialContent: RenderContent = { subject: partial.subject, body: partial.body };
+      await outputsRepo.updatePartialContent(input.dispatchId, partialContent);
+      publish(input.runId, { type: "partial", content: partialContent });
     }
 
     const final = await result.output;
@@ -63,7 +66,9 @@ export async function generateCreative(input: {
   });
 
   for await (const partial of result.partialOutputStream) {
-    await outputsRepo.updatePartialContent(input.dispatchId, { html: partial.html, headline: partial.headline });
+    const partialContent: RenderContent = { html: partial.html, headline: partial.headline };
+    await outputsRepo.updatePartialContent(input.dispatchId, partialContent);
+    publish(input.runId, { type: "partial", content: partialContent });
   }
 
   const final = await result.output;

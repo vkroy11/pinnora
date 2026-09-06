@@ -2,13 +2,15 @@ import type { NextRequest } from "next/server";
 import { requireAppUser } from "@/lib/auth";
 import { getDispatch, requestCancel, type PhaseEntry } from "@/lib/db/repositories/dispatches";
 import { getOutputByDispatchId } from "@/lib/db/repositories/outputs";
-import { abortRun, type RunEvent } from "@/lib/services/run-events";
+import { abortRun, subscribe, type RunEvent } from "@/lib/services/run-events";
+import { IS_VERCEL } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled", "ambiguous", "unsupported"]);
-// Serverless instances don't share memory, so a live push (in-memory pub/sub) from the
+const TERMINAL_EVENT_TYPES = new Set<RunEvent["type"]>(["done", "error", "cancelled", "ambiguous", "unsupported"]);
+// Only used on Vercel: serverless instances don't share memory, so a live push from the
 // background generation job may never reach this request's instance. Polling the DB is
 // slower than a push but is correct regardless of which instance is doing the work.
 const POLL_MS = 400;
@@ -66,6 +68,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
   const encoder = new TextEncoder();
   let closed = false;
   let lastWriteAt = Date.now();
+  let unsubscribe: (() => void) | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -81,6 +85,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
       const close = () => {
         if (closed) return;
         closed = true;
+        unsubscribe?.();
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
         try {
           controller.close();
         } catch {
@@ -118,31 +124,45 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
         return;
       }
 
-      const startedAt = Date.now();
-      while (!closed) {
-        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
-        if (closed) break;
-        if (Date.now() - startedAt > MAX_STREAM_MS) {
-          close();
-          break;
+      if (IS_VERCEL) {
+        // Poll the DB -- see the module comment on POLL_MS.
+        const startedAt = Date.now();
+        while (!closed) {
+          await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+          if (closed) break;
+          if (Date.now() - startedAt > MAX_STREAM_MS) {
+            close();
+            break;
+          }
+          if (Date.now() - lastWriteAt > HEARTBEAT_MS) write(": heartbeat\n\n");
+          const dispatch = await getDispatch(runId);
+          if (!dispatch) {
+            close();
+            break;
+          }
+          const output = await getOutputByDispatchId(runId);
+          if (emitFromState(dispatch, output)) {
+            close();
+            break;
+          }
         }
-        if (Date.now() - lastWriteAt > HEARTBEAT_MS) {
-          write(": heartbeat\n\n");
-        }
-        const dispatch = await getDispatch(runId);
-        if (!dispatch) {
-          close();
-          break;
-        }
-        const output = await getOutputByDispatchId(runId);
-        if (emitFromState(dispatch, output)) {
-          close();
-          break;
-        }
+        return;
       }
+
+      // Real push delivery: this process is the only instance there is.
+      unsubscribe = subscribe(runId, (event) => {
+        send(event);
+        if (TERMINAL_EVENT_TYPES.has(event.type)) close();
+      });
+      heartbeatTimer = setInterval(() => {
+        if (!closed && Date.now() - lastWriteAt > HEARTBEAT_MS) write(": heartbeat\n\n");
+      }, HEARTBEAT_MS);
+      setTimeout(() => close(), MAX_STREAM_MS);
     },
     cancel() {
       closed = true;
+      unsubscribe?.();
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
       abortRun(runId);
       void requestCancel(runId);
     },
@@ -150,6 +170,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ runI
 
   req.signal.addEventListener("abort", () => {
     closed = true;
+    unsubscribe?.();
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     abortRun(runId);
     void requestCancel(runId);
   });
