@@ -18,6 +18,7 @@ const KIND_LABELS: Record<DispatchKind, string> = {
 };
 
 const IN_FLIGHT_STATUSES: ClientRun["status"][] = ["connecting", "classifying", "dispatched", "streaming"];
+const TERMINAL_STATUSES: ClientRun["status"][] = ["done", "failed", "cancelled", "ambiguous", "unsupported"];
 // Every tile body renders inside this same block height so grid rows line up regardless
 // of kind or how much content a given run produced.
 const TILE_BODY_HEIGHT = 176;
@@ -56,8 +57,14 @@ export function CanvasTile({
       const data = JSON.parse(e.data);
       patch({ status: "awaiting_confirmation", kind: data.kind, confidence: data.confidence });
     });
-    source.addEventListener("ambiguous", () => patch({ status: "ambiguous" }));
-    source.addEventListener("unsupported", () => patch({ status: "unsupported" }));
+    source.addEventListener("ambiguous", () => {
+      patch({ status: "ambiguous" });
+      source.close();
+    });
+    source.addEventListener("unsupported", () => {
+      patch({ status: "unsupported" });
+      source.close();
+    });
     source.addEventListener("dispatched", () => patch({ status: "dispatched" }));
     source.addEventListener("partial", (e) => {
       const data = JSON.parse(e.data);
@@ -69,9 +76,10 @@ export function CanvasTile({
       source.close();
     });
     source.addEventListener("error", (e) => {
-      // Only treat as a stream failure if we haven't already reached a terminal state
-      // (browsers fire a generic "error" event on clean server-side stream close too).
-      if (runRef.current.status === "done" || runRef.current.status === "cancelled") return;
+      // Only treat as a stream failure if we haven't already reached a terminal state --
+      // browsers fire a generic, data-less "error" event on any dropped connection, including
+      // a clean server-side close, so this must never flip an already-terminal tile to "failed".
+      if (TERMINAL_STATUSES.includes(runRef.current.status)) return;
       const data = (e as MessageEvent).data ? JSON.parse((e as MessageEvent).data) : null;
       if (data) {
         patch({ status: "failed", error: data.message });
