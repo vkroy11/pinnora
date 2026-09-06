@@ -7,8 +7,6 @@ import { computeIdempotencyKey, IDEMPOTENCY_WINDOW_MS } from "@/lib/idempotency"
 import * as dispatchesRepo from "@/lib/db/repositories/dispatches";
 import { runDispatchPipeline } from "@/lib/services/pipeline";
 
-const CLASSIFIER_MODEL = "gemini-2.5-flash-lite";
-
 export async function dispatchCreative(input: unknown): Promise<{ runId: string }> {
   const parsed = dispatchInputSchema.parse(input);
   const { user } = await requireOwnedProject(parsed.projectId);
@@ -32,7 +30,6 @@ export async function dispatchCreative(input: unknown): Promise<{ runId: string 
     explicitIntent: parsed.intent ?? null,
     parentArtifactId: parsed.parentArtifactId ?? null,
     idempotencyKey,
-    model: CLASSIFIER_MODEL,
   });
 
   // Keeps running past this action's response; the stream route is the only

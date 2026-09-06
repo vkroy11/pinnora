@@ -1,18 +1,32 @@
 import { getDb } from "@/db";
 import { creditLedger } from "@/db/schema";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 export async function grant(userId: string, amount: number) {
   const rows = await getDb().insert(creditLedger).values({ userId, kind: "grant", amount }).returning();
   return rows[0];
 }
 
-export async function insertHold(userId: string, dispatchId: string, amount: number) {
-  const rows = await getDb()
-    .insert(creditLedger)
-    .values({ userId, dispatchId, kind: "hold", amount: -Math.abs(amount) })
-    .returning();
-  return rows[0];
+/** Inserts the hold only if the balance covers it, in a single statement so a burst of
+ * concurrent dispatches can't race two holds past the same remaining credits. Returns the
+ * hold id, or null when the user can't afford the run. */
+export async function insertHoldIfSufficient(
+  userId: string,
+  dispatchId: string,
+  amount: number,
+): Promise<string | null> {
+  const cost = Math.abs(amount);
+  const result = await getDb().execute(sql`
+    insert into credit_ledger (user_id, dispatch_id, kind, amount)
+    select ${userId}::uuid, ${dispatchId}::uuid, 'hold', ${-cost}
+    where (
+      select coalesce(sum(amount), 0) from credit_ledger
+      where user_id = ${userId}::uuid and released_at is null
+    ) >= ${cost}
+    returning id
+  `);
+  const rows = (result as unknown as { rows: { id: string }[] }).rows;
+  return rows[0]?.id ?? null;
 }
 
 export async function settleHold(holdId: string) {
@@ -29,6 +43,23 @@ export async function releaseHold(holdId: string) {
     .where(and(eq(creditLedger.id, holdId), isNull(creditLedger.settledAt)));
 }
 
+/** Releases every still-open hold for a dispatch. Used when a run is finalized by something
+ * other than its own pipeline (an operator's Stop, or the stale-run reaper), where the hold
+ * id isn't in hand -- an interrupted pipeline would otherwise leak its reservation forever. */
+export async function releaseOpenHoldsForDispatch(dispatchId: string) {
+  await getDb()
+    .update(creditLedger)
+    .set({ releasedAt: new Date() })
+    .where(
+      and(
+        eq(creditLedger.dispatchId, dispatchId),
+        eq(creditLedger.kind, "hold"),
+        isNull(creditLedger.settledAt),
+        isNull(creditLedger.releasedAt),
+      ),
+    );
+}
+
 export async function getBalance(userId: string): Promise<number> {
   const rows = await getDb()
     .select({ balance: sql<string>`coalesce(sum(${creditLedger.amount}), 0)` })
@@ -37,8 +68,15 @@ export async function getBalance(userId: string): Promise<number> {
   return Number(rows[0]?.balance ?? 0);
 }
 
+/** The hold that actually paid for the run. A dispatch can have more than one: a 0.6-0.8
+ * run releases its classifier-time hold while parked, then takes a fresh one on confirm. */
 export async function getLedgerRowByDispatchId(dispatchId: string) {
-  const rows = await getDb().select().from(creditLedger).where(eq(creditLedger.dispatchId, dispatchId)).limit(1);
+  const rows = await getDb()
+    .select()
+    .from(creditLedger)
+    .where(eq(creditLedger.dispatchId, dispatchId))
+    .orderBy(desc(creditLedger.createdAt))
+    .limit(1);
   return rows[0] ?? null;
 }
 
