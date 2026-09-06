@@ -8,6 +8,7 @@ import { balance } from "@/lib/services/credit-service";
 import { createNewProject } from "@/app/actions/projects";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle } from "@/components/ui/card";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 export default async function ProjectsPage() {
   const { userId: clerkUserId } = await auth();
@@ -29,6 +30,7 @@ export default async function ProjectsPage() {
           <form action={createNewProject}>
             <Button type="submit">New chat</Button>
           </form>
+          <ThemeToggle />
           <UserButton />
         </div>
       </div>
