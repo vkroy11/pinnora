@@ -7,6 +7,7 @@ import { CanvasTile } from "@/components/canvas-tile";
 import { WhyDrawer } from "@/components/why-drawer";
 import { OutputModal } from "@/components/output-modal";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { EditableProjectName } from "@/components/editable-project-name";
 import { getMyBalance } from "@/app/actions/get-balance";
 import type { ClientRun } from "@/components/run-types";
 import type { DispatchKind } from "@/db/schema";
@@ -65,7 +66,7 @@ export function ProjectCanvas({
           <Link href="/projects" className="text-sm text-muted-foreground hover:underline">
             ← Chats
           </Link>
-          <h1 className="font-medium">{projectName}</h1>
+          <EditableProjectName projectId={projectId} name={projectName} />
         </div>
         <div className="flex items-center gap-2">
           <span className="text-sm text-muted-foreground">{credits} credits</span>
