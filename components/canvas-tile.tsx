@@ -29,6 +29,7 @@ export function CanvasTile({
   onUpdate,
   onOpenDrawer,
   onOpenModal,
+  onOpenParentModal,
   onImprovise,
 }: {
   run: ClientRun;
@@ -36,6 +37,7 @@ export function CanvasTile({
   onUpdate: (runId: string, patch: Partial<ClientRun>) => void;
   onOpenDrawer: (runId: string) => void;
   onOpenModal: (runId: string) => void;
+  onOpenParentModal: (parentOutputId: string) => void;
   onImprovise: (parentArtifactId: string, kind: DispatchKind) => void;
 }) {
   const runRef = useRef(run);
@@ -123,7 +125,18 @@ export function CanvasTile({
       </CardContent>
       <CardFooter className="flex items-center justify-between gap-2">
         <div className="flex flex-col items-start gap-1">
-          {run.parentArtifactId && <span className="text-xs text-muted-foreground">Improvised from →</span>}
+          {run.parentArtifactId && (
+            <button
+              type="button"
+              className="text-xs text-muted-foreground hover:underline"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenParentModal(run.parentArtifactId!);
+              }}
+            >
+              Improvised from →
+            </button>
+          )}
           {run.status === "done" && run.kind && run.outputId && (
             <Button
               size="sm"

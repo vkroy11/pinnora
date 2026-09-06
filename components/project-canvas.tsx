@@ -52,6 +52,11 @@ export function ProjectCanvas({
     setImproviseContext({ parentArtifactId, kind });
   }
 
+  function handleOpenParentModal(parentOutputId: string) {
+    const parent = runs.find((r) => r.outputId === parentOutputId);
+    if (parent) setOutputModalRunId(parent.runId);
+  }
+
   function handleTileUpdate(runId: string, patch: Partial<ClientRun>) {
     setRuns((prev) => prev.map((r) => (r.runId === runId ? { ...r, ...patch } : r)));
     if (patch.status) refreshBalance();
@@ -88,6 +93,7 @@ export function ProjectCanvas({
               onUpdate={handleTileUpdate}
               onOpenDrawer={setDrawerRunId}
               onOpenModal={setOutputModalRunId}
+              onOpenParentModal={handleOpenParentModal}
               onImprovise={handleImprovise}
             />
           ))}
