@@ -10,7 +10,12 @@ export const landingPageOutputSchema = z.object({
         "the brand/prompt, a hero section with a headline and subheadline, a body/features section, and one " +
         "clear call-to-action button.",
     ),
-  headline: z.string().describe("The hero headline, duplicated as plain text for grid previews and lineage context"),
+  // The brief's structured shape, kept alongside the rendered document: the same hero copy
+  // and CTA as plain fields, so the artifact is queryable//re-usable without parsing HTML.
+  headline: z.string().describe("The hero headline, as plain text"),
+  body: z.string().describe("The hero subheadline / supporting copy, as plain text"),
+  ctaLabel: z.string().describe("The call-to-action button label used in the page"),
+  ctaUrl: z.string().describe("The call-to-action destination URL (a placeholder is fine)"),
   rationale: z.string().describe("One or two sentences on why this structure/copy/color choice fits the prompt"),
 });
 export type LandingPageOutput = z.infer<typeof landingPageOutputSchema>;

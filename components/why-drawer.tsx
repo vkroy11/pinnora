@@ -36,7 +36,8 @@ export function WhyDrawer({ runId, onClose }: { runId: string | null; onClose: (
                 value={visibleDetails.classifiedConfidence != null ? `${Math.round(visibleDetails.classifiedConfidence * 100)}%` : "—"}
               />
               <Field label="Decided by" value={visibleDetails.kindSource === "human" ? "You (confirmed)" : "Classifier"} />
-              <Field label="Model" value={visibleDetails.model ?? "—"} />
+              <Field label="Generation model" value={visibleDetails.model ?? "—"} />
+              <Field label="Classifier model" value={visibleDetails.classifierModel ?? "—"} />
             </div>
             {visibleDetails.rationale && <Field label="Why this output" value={visibleDetails.rationale} />}
             {visibleDetails.error && <Field label="Error" value={visibleDetails.error} />}

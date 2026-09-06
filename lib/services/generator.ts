@@ -6,7 +6,7 @@ import { landingPageOutputSchema, emailOutputSchema } from "@/lib/schemas/render
 import * as outputsRepo from "@/lib/db/repositories/outputs";
 import { publish } from "@/lib/services/run-events";
 
-const GENERATION_MODEL = "gemini-3.1-pro-preview";
+export const GENERATION_MODEL = "gemini-3.1-pro-preview";
 
 export type GenerationResult = { content: RenderContent; rationale: string | null };
 
@@ -66,13 +66,19 @@ export async function generateCreative(input: {
   });
 
   for await (const partial of result.partialOutputStream) {
-    const partialContent: RenderContent = { html: partial.html, headline: partial.headline };
+    const partialContent: RenderContent = { html: partial.html, headline: partial.headline, body: partial.body };
     await outputsRepo.updatePartialContent(input.dispatchId, partialContent);
     publish(input.runId, { type: "partial", content: partialContent });
   }
 
   const final = await result.output;
-  const content: RenderContent = { html: final.html, headline: final.headline };
+  const content: RenderContent = {
+    html: final.html,
+    headline: final.headline,
+    body: final.body,
+    ctaLabel: final.ctaLabel,
+    ctaUrl: final.ctaUrl,
+  };
   await outputsRepo.finalizeOutput(input.dispatchId, content, final.rationale);
   return { content, rationale: final.rationale };
 }
