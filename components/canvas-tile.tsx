@@ -27,6 +27,7 @@ export function CanvasTile({
   run,
   subscribeLive,
   onUpdate,
+  onStreamError,
   onOpenDrawer,
   onOpenModal,
   onOpenParentModal,
@@ -35,6 +36,7 @@ export function CanvasTile({
   run: ClientRun;
   subscribeLive: boolean;
   onUpdate: (runId: string, patch: Partial<ClientRun>) => void;
+  onStreamError: () => void;
   onOpenDrawer: (runId: string) => void;
   onOpenModal: (runId: string) => void;
   onOpenParentModal: (parentOutputId: string) => void;
@@ -86,7 +88,10 @@ export function CanvasTile({
       if (data) {
         patch({ status: "failed", error: data.message });
         source.close();
+        return;
       }
+      // Data-less error == the connection dropped. Don't guess at state; ask the server.
+      onStreamError();
     });
     source.addEventListener("cancelled", () => {
       patch({ status: "cancelled" });
@@ -134,7 +139,7 @@ export function CanvasTile({
                 onOpenParentModal(run.parentArtifactId!);
               }}
             >
-              Improvised from →
+              Improvised from → {run.parentArtifactId?.slice(0, 8)}...
             </button>
           )}
           {run.status === "done" && run.kind && run.outputId && (
@@ -192,11 +197,42 @@ function TileFrame({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** What the run is doing right now, in plain language, so a pending tile is never a
+ * silent grey box. Mirrors the phase timeline the "why this?" drawer shows after the fact. */
+function activityLabel(run: ClientRun): string | null {
+  switch (run.status) {
+    case "connecting":
+      return "Queued — sending to the classifier…";
+    case "classifying":
+      return run.kind ? `Classified as ${KIND_LABELS[run.kind]} — reserving credits…` : "Classifying your prompt…";
+    case "dispatched":
+      return "10 credits held — generating…";
+    case "streaming": {
+      const chars = (run.content?.html ?? run.content?.body ?? "").length;
+      return chars > 0 ? `Streaming… ${chars.toLocaleString()} characters` : "Streaming…";
+    }
+    default:
+      return null;
+  }
+}
+
+function ActivityLine({ run }: { run: ClientRun }) {
+  const label = activityLabel(run);
+  if (!label) return null;
+  return (
+    <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+      <span className="inline-block size-1.5 animate-pulse rounded-full bg-muted-foreground" />
+      {label}
+    </p>
+  );
+}
+
 function TileBody({ run, onConfirm }: { run: ClientRun; onConfirm: (kind: DispatchKind) => void }) {
   if (run.status === "connecting" || run.status === "classifying" || run.status === "dispatched") {
     return (
       <TileFrame>
         <Skeleton className="h-full w-full" />
+        <ActivityLine run={run} />
       </TileFrame>
     );
   }
@@ -260,7 +296,12 @@ function TileBody({ run, onConfirm }: { run: ClientRun; onConfirm: (kind: Dispat
   }
   if (run.kind === "landing-page") {
     if (run.status === "streaming") {
-      return <CodeTypewriter code={run.content?.html ?? ""} />;
+      return (
+        <div className="flex flex-col gap-1" style={{ height: TILE_BODY_HEIGHT }}>
+          <CodeTypewriter code={run.content?.html ?? ""} />
+          <ActivityLine run={run} />
+        </div>
+      );
     }
     return run.content?.html ? (
       <LandingPageThumbnail html={run.content.html} />
@@ -275,9 +316,10 @@ function TileBody({ run, onConfirm }: { run: ClientRun; onConfirm: (kind: Dispat
     <TileFrame>
       <div className="flex h-full flex-col gap-1 overflow-hidden text-sm">
         {run.content?.subject && <p className="line-clamp-1 font-semibold">{run.content.subject}</p>}
-        {run.content?.body && <p className="line-clamp-5 text-muted-foreground">{run.content.body}</p>}
+        {run.content?.body && <p className="line-clamp-4 text-muted-foreground">{run.content.body}</p>}
         {run.status === "streaming" && <BlinkingCursor />}
       </div>
+      {run.status === "streaming" && <ActivityLine run={run} />}
     </TileFrame>
   );
 }
@@ -299,8 +341,7 @@ function CodeTypewriter({ code }: { code: string }) {
   return (
     <pre
       ref={scrollRef}
-      style={{ height: TILE_BODY_HEIGHT }}
-      className="overflow-y-auto whitespace-pre-wrap break-all rounded border bg-muted p-2 font-mono text-[10px] leading-relaxed"
+      className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap break-all rounded border bg-muted p-2 font-mono text-[10px] leading-relaxed"
     >
       {code}
       <BlinkingCursor />

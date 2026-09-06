@@ -1,19 +1,24 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChatComposer, type ImproviseContext } from "@/components/chat-composer";
 import { CanvasTile } from "@/components/canvas-tile";
 import { WhyDrawer } from "@/components/why-drawer";
 import { OutputModal } from "@/components/output-modal";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { EditableProjectName } from "@/components/editable-project-name";
-import { getMyBalance } from "@/app/actions/get-balance";
+import { getProjectRuns } from "@/app/actions/get-project-runs";
 import type { ClientRun } from "@/components/run-types";
 import type { DispatchKind } from "@/db/schema";
 
 const TERMINAL_STATUSES: ClientRun["status"][] = ["done", "failed", "cancelled", "ambiguous", "unsupported"];
-const BALANCE_REFRESH_DEBOUNCE_MS = 500;
+// Reconciliation backstop while anything is still running: even if every SSE event were
+// lost, the canvas still converges on the server's truth within this interval.
+const ACTIVE_REFETCH_MS = 4_000;
+
+type CanvasData = { runs: ClientRun[]; credits: number };
 
 export function ProjectCanvas({
   projectId,
@@ -26,26 +31,48 @@ export function ProjectCanvas({
   initialCredits: number;
   initialRuns: ClientRun[];
 }) {
-  const [runs, setRuns] = useState<ClientRun[]>(initialRuns);
+  const queryClient = useQueryClient();
+  const queryKey = ["project-runs", projectId];
+
+  const { data } = useQuery<CanvasData>({
+    queryKey,
+    queryFn: () => getProjectRuns(projectId),
+    initialData: { runs: initialRuns, credits: initialCredits },
+    refetchInterval: (query) =>
+      (query.state.data?.runs ?? []).some((r) => !TERMINAL_STATUSES.includes(r.status)) ? ACTIVE_REFETCH_MS : false,
+  });
+
+  const runs = data.runs;
+  const credits = data.credits;
+
   const [liveRunIds] = useState<Set<string>>(() => new Set());
   const [improviseContext, setImproviseContext] = useState<ImproviseContext | null>(null);
   const [drawerRunId, setDrawerRunId] = useState<string | null>(null);
   const [outputModalRunId, setOutputModalRunId] = useState<string | null>(null);
-  const [credits, setCredits] = useState(initialCredits);
-  const balanceRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  function refreshBalance() {
-    if (balanceRefreshTimer.current) return;
-    balanceRefreshTimer.current = setTimeout(() => {
-      balanceRefreshTimer.current = null;
-      void getMyBalance().then(setCredits);
-    }, BALANCE_REFRESH_DEBOUNCE_MS);
+  /** SSE fast path: patch the cache directly so the UI updates instantly, without a round trip. */
+  function handleTileUpdate(runId: string, patch: Partial<ClientRun>) {
+    queryClient.setQueryData<CanvasData>(queryKey, (prev) =>
+      prev
+        ? { ...prev, runs: prev.runs.map((r) => (r.runId === runId ? { ...r, ...patch } : r)) }
+        : prev,
+    );
+    // A status change also moves credits (hold on dispatch, settle/release at the end).
+    if (patch.status) void queryClient.invalidateQueries({ queryKey });
+  }
+
+  /** The stream is only ever an optimization -- if it drops, fall back to the server. */
+  function handleStreamError() {
+    void queryClient.invalidateQueries({ queryKey });
   }
 
   function handleDispatched(runId: string, prompt: string, parentArtifactId: string | null) {
     liveRunIds.add(runId);
-    setRuns((prev) => [{ runId, prompt, parentArtifactId, status: "connecting" }, ...prev]);
-    refreshBalance();
+    queryClient.setQueryData<CanvasData>(queryKey, (prev) => {
+      const optimistic: ClientRun = { runId, prompt, parentArtifactId, status: "connecting" };
+      return prev ? { ...prev, runs: [optimistic, ...prev.runs] } : { runs: [optimistic], credits };
+    });
+    void queryClient.invalidateQueries({ queryKey });
   }
 
   function handleImprovise(parentArtifactId: string, kind: DispatchKind) {
@@ -55,11 +82,6 @@ export function ProjectCanvas({
   function handleOpenParentModal(parentOutputId: string) {
     const parent = runs.find((r) => r.outputId === parentOutputId);
     if (parent) setOutputModalRunId(parent.runId);
-  }
-
-  function handleTileUpdate(runId: string, patch: Partial<ClientRun>) {
-    setRuns((prev) => prev.map((r) => (r.runId === runId ? { ...r, ...patch } : r)));
-    if (patch.status) refreshBalance();
   }
 
   const outputModalRun = runs.find((r) => r.runId === outputModalRunId) ?? null;
@@ -91,6 +113,7 @@ export function ProjectCanvas({
               run={run}
               subscribeLive={liveRunIds.has(run.runId) || !TERMINAL_STATUSES.includes(run.status)}
               onUpdate={handleTileUpdate}
+              onStreamError={handleStreamError}
               onOpenDrawer={setDrawerRunId}
               onOpenModal={setOutputModalRunId}
               onOpenParentModal={handleOpenParentModal}
