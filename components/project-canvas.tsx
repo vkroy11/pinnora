@@ -9,6 +9,7 @@ import { WhyDrawer } from "@/components/why-drawer";
 import { OutputModal } from "@/components/output-modal";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { EditableProjectName } from "@/components/editable-project-name";
+import { CreditLedgerDialog } from "@/components/credit-ledger-dialog";
 import { getProjectRuns } from "@/app/actions/get-project-runs";
 import type { ClientRun } from "@/components/run-types";
 import type { DispatchKind } from "@/db/schema";
@@ -49,6 +50,7 @@ export function ProjectCanvas({
   const [improviseContext, setImproviseContext] = useState<ImproviseContext | null>(null);
   const [drawerRunId, setDrawerRunId] = useState<string | null>(null);
   const [outputModalRunId, setOutputModalRunId] = useState<string | null>(null);
+  const [ledgerOpen, setLedgerOpen] = useState(false);
 
   /** SSE fast path: patch the cache directly so the UI updates instantly, without a round trip. */
   function handleTileUpdate(runId: string, patch: Partial<ClientRun>) {
@@ -96,7 +98,14 @@ export function ProjectCanvas({
           <EditableProjectName projectId={projectId} name={projectName} />
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-sm text-muted-foreground">{credits} credits</span>
+          <button
+            type="button"
+            onClick={() => setLedgerOpen(true)}
+            title="View credit ledger"
+            className="rounded px-2 py-1 text-sm text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            {credits} credits
+          </button>
           <ThemeToggle />
         </div>
       </header>
@@ -130,6 +139,7 @@ export function ProjectCanvas({
       />
       <WhyDrawer runId={drawerRunId} onClose={() => setDrawerRunId(null)} />
       <OutputModal run={outputModalRun} onClose={() => setOutputModalRunId(null)} />
+      <CreditLedgerDialog open={ledgerOpen} onClose={() => setLedgerOpen(false)} />
     </div>
   );
 }

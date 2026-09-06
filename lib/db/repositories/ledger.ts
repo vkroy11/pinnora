@@ -1,5 +1,5 @@
 import { getDb } from "@/db";
-import { creditLedger } from "@/db/schema";
+import { creditLedger, dispatches } from "@/db/schema";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 export async function grant(userId: string, amount: number) {
@@ -58,6 +58,27 @@ export async function releaseOpenHoldsForDispatch(dispatchId: string) {
         isNull(creditLedger.releasedAt),
       ),
     );
+}
+
+/** Statement view: every ledger entry for a user, newest first, with the prompt it paid for. */
+export function listLedgerForUser(userId: string, limit = 100) {
+  return getDb()
+    .select({
+      id: creditLedger.id,
+      kind: creditLedger.kind,
+      amount: creditLedger.amount,
+      createdAt: creditLedger.createdAt,
+      settledAt: creditLedger.settledAt,
+      releasedAt: creditLedger.releasedAt,
+      dispatchId: creditLedger.dispatchId,
+      prompt: dispatches.prompt,
+      dispatchStatus: dispatches.status,
+    })
+    .from(creditLedger)
+    .leftJoin(dispatches, eq(creditLedger.dispatchId, dispatches.id))
+    .where(eq(creditLedger.userId, userId))
+    .orderBy(desc(creditLedger.createdAt))
+    .limit(limit);
 }
 
 export async function getBalance(userId: string): Promise<number> {
