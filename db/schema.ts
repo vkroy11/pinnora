@@ -4,6 +4,7 @@ import {
   text,
   integer,
   doublePrecision,
+  boolean,
   timestamp,
   jsonb,
   index,
@@ -77,6 +78,10 @@ export const dispatches = pgTable(
     status: text("status").$type<DispatchStatus>().notNull().default("queued"),
     model: text("model"),
     error: text("error"),
+    // Cross-instance cancellation signal: the SSE route (which may run on a different
+    // serverless instance than the generation job) sets this instead of relying on an
+    // in-memory AbortController it may not have access to. The pipeline polls it.
+    cancelRequested: boolean("cancel_requested").notNull().default(false),
     idempotencyKey: text("idempotency_key").notNull(),
     // [{ phase: string, at: string (ISO), detail?: string }]
     phases: jsonb("phases").$type<{ phase: string; at: string; detail?: string }[]>().notNull().default([]),
@@ -91,10 +96,10 @@ export const dispatches = pgTable(
 
 export type RenderContent = {
   url?: string; // image
-  headline?: string; // landing-page / email
-  body?: string;
-  ctaLabel?: string;
-  ctaUrl?: string;
+  html?: string; // landing-page: full self-contained HTML document
+  headline?: string; // landing-page: hero headline, duplicated as plain text for previews
+  subject?: string; // email
+  body?: string; // email
 };
 
 // Creative outputs. 1:1 with a dispatch, self-referential for lineage.
