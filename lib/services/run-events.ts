@@ -16,9 +16,21 @@ export type RunEvent =
 // is NOT relied on for correctness -- the stream route falls back to DB polling there (see
 // lib/config.ts). Off Vercel (local dev, a persistent host like EC2) it's the only instance
 // there is, so this gives real push delivery with near-zero latency.
-const emitters = new Map<string, EventEmitter>();
-const abortControllers = new Map<string, AbortController>();
-const pendingCancels = new Map<string, ReturnType<typeof setTimeout>>();
+//
+// These live on globalThis deliberately. Next.js bundles the "react-server" layer (server
+// components + server actions, where `after()` runs the pipeline) separately from route
+// handlers (where the SSE endpoint lives), so a plain module-level Map is instantiated
+// *twice* in the same process: the pipeline would publish into one copy while the stream
+// route subscribed to the other, and every event would land on zero listeners.
+const globalForRunEvents = globalThis as unknown as {
+  __pinnoraEmitters?: Map<string, EventEmitter>;
+  __pinnoraAbortControllers?: Map<string, AbortController>;
+  __pinnoraPendingCancels?: Map<string, ReturnType<typeof setTimeout>>;
+};
+
+const emitters = (globalForRunEvents.__pinnoraEmitters ??= new Map<string, EventEmitter>());
+const abortControllers = (globalForRunEvents.__pinnoraAbortControllers ??= new Map<string, AbortController>());
+const pendingCancels = (globalForRunEvents.__pinnoraPendingCancels ??= new Map<string, ReturnType<typeof setTimeout>>());
 
 // React Strict Mode (dev only) double-invokes effects: an EventSource opens, is
 // immediately closed by the synthetic cleanup, then a real one opens right after. That
